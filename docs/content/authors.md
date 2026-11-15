@@ -1267,3 +1267,54 @@ put them back in again. -->
 - Stochastic <138764723+Asthenia0412@users.noreply.github.com>
 - James Truitt <80006053+jtruitt1@users.noreply.github.com>
 - firatkaya <firat@netiket.com.tr>
+- kevin9327 <5299031+kevin9327@users.noreply.github.com>
+- drakeo338 <paranoyouz@gmail.com>
+- Alessio Margelli <alex9446@gmail.com>
+- Ludovic Bondon <ludovic.bondon@360learning.com>
+- fmterrors <fmterrors@outlook.com>
+- GingerAdonis <2751672+GingerAdonis@users.noreply.github.com>
+- Satvik Mishra <Satvikmishra.ipu146183@maims.ac.in>
+- wjc <2821296948@qq.com>
+- Maksym Tymoshyk <maksym.tymoshyk@gmail.com>
+- Aniket <aniketkomailkro@gmail.com>
+- Oshino Penguin <penguin@oshino.moe>
+- Yousef Issa <yousef@u.northwestern.edu>
+- ghwany <9hwany@gmail.com>
+- DEVN <nguyenvanthe994@gmail.com>
+- 47th <161213233+flcrom@users.noreply.github.com>
+- Sash <sash@ela.city>
+- Shreyansh Jain <shreyanshjain646@gmail.com>
+- Biagio Peccerillo <biagio.peccerillo@isti.cnr.it>
+- gomitrah <bala.c@mitrahsoft.in>
+- Jim Counter <jim@autonomys.xyz>
+- Dirk Einecke <dirk.einecke@gmail.com>
+- ASRodrigo1 <45823308+asrodrigo1@users.noreply.github.com>
+- chaogeshuodiannao <chaogeshuodiannao@users.noreply.github.com>
+- David Legrand <david.legrand@clever.cloud>
+- Azhar <stfuazzo@gmail.com>
+- Daniel Bae <rootdevdb@gmail.com>
+- frodleTian <16165444+tianhaotian@users.noreply.github.com>
+- Cestercian <yashafaid@gmail.com>
+- Ayush Sharma <175855728+DurdensDream@users.noreply.github.com>
+- Dirk Petersen <1427719+dirkpetersen@users.noreply.github.com>
+- Codex <noreply@openai.com>
+- bunnysayzz <bunnysayzz@users.noreply.github.com>
+- hahahahahayesyeseys <1145018948@qq.com>
+- qodelicious <162776175+qodelicious@users.noreply.github.com>
+- fixfon <12512757+fixfon@users.noreply.github.com>
+- berce <75228263+bercedev@users.noreply.github.com>
+- Fred <24314560+creativeprojects@users.noreply.github.com>
+- Florian Josef Altendorfer <info@altendorfer.dev>
+- ashwinibailangadi <ashwinib40@gmail.com>
+- ilya lavrenov <17838283+ilyalavrenov@users.noreply.github.com>
+- Soujas K <kudchadkarsoujas@gmail.com>
+- Robert Kubiś <robert.h3x@gmail.com>
+- b84330808 <b84330808@gmail.com>
+- Guillaume MALLERET <guillaume.malleret@infomaniak.com>
+- Louis <louis.amoudruz@gmail.com>
+- 唐僧洗发用飘柔 <2906266135@qq.com>
+- Seth Westphal <westy92@gmail.com>
+- ZainnQureshii <43629888+ZainnQureshii@users.noreply.github.com>
+- Rishi Raj Jain <jain71000@gmail.com>
+- Enbiya Göral <100806254+enbiyagoral@users.noreply.github.com>
+- Florian Josef Altendorfer <341419330+florianaltendorfer@users.noreply.github.com>

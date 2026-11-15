@@ -274,7 +274,15 @@ func rcSingleCommand(ctx context.Context, in rc.Params, name string, noRemote bo
 		if err != nil {
 			return nil, err
 		}
-		return nil, DeleteFile(ctx, o)
+		ci := fs.GetConfig(ctx)
+		var backupDir fs.Fs
+		if ci.BackupDir != "" || ci.Suffix != "" {
+			backupDir, err = BackupDir(ctx, f, f, remote)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return nil, DeleteFileWithBackupDir(ctx, o, backupDir)
 	case "copyurl":
 		url, err := in.GetString("url")
 		if err != nil {
@@ -315,7 +323,7 @@ func rcSingleCommand(ctx context.Context, in rc.Params, name string, noRemote bo
 					if err != nil {
 						return nil, err
 					}
-					fs.Debugf(obj, "Upload Succeeded")
+					fs.DebugfCtx(ctx, obj, "Upload Succeeded")
 				}
 			}
 		}
@@ -1208,6 +1216,9 @@ func rcGetFile(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 				start := offset
 				if start < 0 {
 					start += size
+					if start < 0 {
+						start = 0
+					}
 				}
 				if start > size {
 					start = size
