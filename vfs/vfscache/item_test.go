@@ -855,3 +855,32 @@ func TestItemHandleCachingStaleReopenReadsRemote(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, contents, string(buf[:n]))
 }
+
+func TestItemReloadNewDirtyFileReadsLocalData(t *testing.T) {
+	_, c := newItemTestCache(t)
+	c.opt.WriteBack = fs.Duration(time.Hour)
+	item, _ := c.get("new-local")
+	require.NoError(t, item.Open(nil))
+	want := []byte("local data survives a restart")
+	_, err := item.WriteAt(want, 0)
+	require.NoError(t, err)
+	// Leave only the initial dirty marker on disk, as a crash during writes does.
+	item.mu.Lock()
+	item.info.Rs = nil
+	item.info.Size = 0
+	require.NoError(t, item._save())
+	require.NoError(t, item.fd.Close())
+	item.fd = nil
+	item.mu.Unlock()
+	c.mu.Lock()
+	delete(c.item, item.name)
+	c.mu.Unlock()
+	recovered, _ := c.get("new-local")
+	require.NoError(t, recovered.reload(context.Background()))
+	require.NoError(t, recovered.Open(nil))
+	got := make([]byte, len(want))
+	_, err = recovered.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+	require.NoError(t, recovered.Close(nil))
+}

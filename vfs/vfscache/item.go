@@ -865,11 +865,24 @@ func (item *Item) reload(ctx context.Context) error {
 		return nil
 	}
 	// see if the object still exists
-	obj, _ := item.c.fremote.NewObject(ctx, item.name)
+	obj, lookupErr := item.c.fremote.NewObject(ctx, item.name)
 	// open the file with the object (or nil)
 	err := item.Open(obj)
 	if err != nil {
 		return err
+	}
+	// A newly created dirty file has no remote bytes to refill. Its local
+	// contents (including sparse zeroes) are authoritative even if a crash
+	// prevented the written ranges from being saved to the metadata.
+	if errors.Is(lookupErr, fs.ErrorObjectNotFound) {
+		item.mu.Lock()
+		if item.info.Fingerprint == "" {
+			size, sizeErr := item._getSize()
+			if sizeErr == nil {
+				item.info.Rs.Insert(ranges.Range{Pos: 0, Size: size})
+			}
+		}
+		item.mu.Unlock()
 	}
 	// close the file to execute the writeback if needed
 	err = item.Close(nil)
