@@ -16,9 +16,7 @@
 package teldrive
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -171,13 +169,26 @@ keys are managed by the TelDrive server.
 		}, {
 			Name:    "hash_enabled",
 			Default: true,
-			Help: `Enable BLAKE3 tree hashing for file integrity verification.
+			Help: `Advertise BLAKE3 tree hashes for file integrity verification.
 
 Files are split into 16 MiB blocks, each hashed with BLAKE3, then
 the block hashes are combined into a final tree hash. This allows
 rclone to verify upload integrity and detect modifications.
 
-Disable only if the server does not support this hash type.
+Disabling this option does not disable current-byte resume comparisons,
+verified part acknowledgements, or the required completion manifest.
+Uploads require a server supporting the completion manifest protocol.
+`,
+		}, {
+			Name:     "guarded_upload",
+			Default:  false,
+			Advanced: true,
+			Help: `Use the guarded upload protocol.
+
+When enabled, uploads use the owner-only guarded create, status, part
+and complete routes with the server's recovery incarnation and an
+immutable destination. The server must support guarded uploads; the
+backend refuses rather than falling back to unguarded mutation.
 `,
 		}, {
 			Name:     config.ConfigEncoding,
@@ -204,6 +215,7 @@ type Options struct {
 	EncryptFiles      bool                 `config:"encrypt_files"`      // Enable server-side encryption
 	PageSize          int64                `config:"page_size"`          // Directory listing page size
 	HashEnabled       bool                 `config:"hash_enabled"`       // Enable BLAKE3 tree hashing
+	GuardedUpload     bool                 `config:"guarded_upload"`     // Use the guarded upload protocol
 	Enc               encoder.MultiEncoder `config:"encoding"`           // Filename encoding rules
 }
 
@@ -211,34 +223,40 @@ type Options struct {
 // It manages the connection to the TelDrive API, directory cache,
 // rate-limiting pacers, and per-remote configuration.
 type Fs struct {
-	root     string             // Root path on this remote
-	name     string             // Name of this remote in the config
-	opt      Options            // Backend configuration
-	features *fs.Features       // Optional feature flags for this backend
-	srv      *rest.Client       // HTTP client for API calls
-	pacer    *fs.Pacer          // Rate limiter for API requests
-	ssePacer *fs.Pacer          // Dedicated pacer for SSE connection retries
+	root     string       // Root path on this remote
+	name     string       // Name of this remote in the config
+	opt      Options      // Backend configuration
+	features *fs.Features // Optional feature flags for this backend
+	srv      *rest.Client // HTTP client for API calls
+	pacer    *fs.Pacer    // Rate limiter for API requests
+	sseSrv   *rest.Client // Ordered event stream has its own deadlines
+	sseClock sseClock
 	userId   int64              // Authenticated user ID from session
 	dirCache *dircache.DirCache // Cached directory tree for fast path resolution
+	guarded  *guardedIncarnation
 }
 
 // Object represents an teldrive object
 type Object struct {
-	fs       *Fs
-	remote   string
-	id       string
-	size     int64
-	parentId string
-	name     string
-	modTime  time.Time
-	mimeType string
-	hash     string // BLAKE3 tree hash from server
+	fs            *Fs
+	remote        string
+	id            string
+	size          int64
+	parentId      string
+	name          string
+	modTime       time.Time
+	mimeType      string
+	hash          string // BLAKE3 tree hash from server
+	generation    int64  // authoritative file generation
+	guardedResult *api.GuardedFileEntry
+	guardedEpoch  uint64 // namespace epoch captured before the completing request
 }
 
 type apiError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	DecodeErr  error
 }
 
 func (e *apiError) Error() string {
@@ -258,28 +276,46 @@ func (e *apiError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
+	var statusErr error
 	switch e.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return fs.ErrorPermissionDenied
+		statusErr = fs.ErrorPermissionDenied
 	case http.StatusNotFound:
-		return fs.ErrorObjectNotFound
+		statusErr = fs.ErrorObjectNotFound
 	case http.StatusPreconditionFailed:
-		return fs.ErrorImmutableModified
-	default:
-		return nil
+		statusErr = fs.ErrorImmutableModified
 	}
+	if statusErr == nil {
+		return e.DecodeErr
+	}
+	if e.DecodeErr == nil {
+		return statusErr
+	}
+	return errors.Join(statusErr, e.DecodeErr)
 }
 
 func errorHandler(resp *http.Response) error {
 	envelope := new(api.ErrorEnvelope)
 	if err := rest.DecodeJSON(resp, envelope); err != nil {
-		return &apiError{StatusCode: resp.StatusCode, Message: resp.Status}
+		apiErr := &apiError{StatusCode: resp.StatusCode, Message: resp.Status, DecodeErr: err}
+		return apiErr
 	}
-	return &apiError{
+	err := &apiError{
 		StatusCode: resp.StatusCode,
 		Code:       envelope.Error.Code,
 		Message:    envelope.Error.Message,
 	}
+	if err.StatusCode == http.StatusConflict && err.Code == "upload_parent_unavailable" {
+		return fserrors.FatalError(err)
+	}
+	// A guarded mismatch is a typed, non-retryable refusal of this attempt.
+	switch err.Code {
+	case "upload_recovery_changed":
+		return &guardedProtocolError{apiError: err, sentinel: errUploadRecoveryChanged}
+	case "upload_destination_changed":
+		return &guardedProtocolError{apiError: err, sentinel: errUploadDestinationChanged}
+	}
+	return err
 }
 
 // Name of the remote (as passed into NewFs)
@@ -381,12 +417,6 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		root:  root,
 		opt:   *opt,
 		pacer: fs.NewPacer(ctx, pacer.NewDefault()),
-		// Dedicated SSE pacer with optimized settings for connection retries
-		ssePacer: fs.NewPacer(ctx, pacer.NewDefault(
-			pacer.MinSleep(1*time.Second),
-			pacer.MaxSleep(30*time.Second),
-			pacer.DecayConstant(2),
-		)),
 	}
 
 	f.root = strings.Trim(root, "/")
@@ -406,6 +436,12 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 		return nil, errors.New("missing api_key")
 	}
 	f.srv.SetHeader(apiKeyHeaderName, opt.APIKey)
+	sseCtx, sseConfig := fs.AddConfig(ctx)
+	sseConfig.Timeout = 0
+	sseConfig.Dump = 0
+	f.sseSrv = rest.NewClient(fshttp.NewClient(sseCtx)).
+		SetRoot(strings.Trim(opt.ApiHost, "/")).
+		SetHeader(apiKeyHeaderName, opt.APIKey)
 
 	opts := rest.Opts{
 		Method: "GET",
@@ -431,13 +467,13 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 
 	f.userId = session.UserId
 
-	f.dirCache = dircache.New(f.root, rootID, f)
+	f.dirCache = dircache.NewPinned(f.root, rootID, f)
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
 		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
+		tempF.dirCache = dircache.NewPinned(newRoot, rootID, &tempF)
 		tempF.root = newRoot
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
@@ -560,8 +596,12 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 
 // ListP lists one directory and invokes callback once per API page.
 func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	epoch := f.dirCache.NamespaceEpoch()
 	opts := &api.MetadataRequestOptions{Limit: f.opt.PageSize}
 	for {
+		if err := f.reconcileDiscovery(ctx, dir, true); err != nil {
+			return err
+		}
 		info, err := f.readMetaDataForPath(ctx, dir, opts)
 		if err != nil {
 			if errors.Is(err, fs.ErrorObjectNotFound) {
@@ -569,12 +609,17 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 			return err
 		}
+		if err := f.dirCache.CheckNamespace(epoch); err != nil {
+			return err
+		}
 		entries := make(fs.DirEntries, 0, len(info.Files))
 		for _, item := range info.Files {
 			remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
 			switch item.Kind {
 			case "folder":
-				f.dirCache.Put(remote, item.Id)
+				if err := f.dirCache.PutAtEpoch(remote, item.Id, epoch); err != nil {
+					return err
+				}
 				entries = append(entries, fs.NewDir(remote, item.ModTime).
 					SetID(item.Id).
 					SetParentID(parentIDOrRoot(item.ParentId)).
@@ -587,9 +632,18 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 		}
 		if len(entries) > 0 {
+			if err := f.reconcileDiscovery(ctx, dir, true); err != nil {
+				return err
+			}
+			if err := f.dirCache.CheckNamespace(epoch); err != nil {
+				return err
+			}
 			if err := callback(entries); err != nil {
 				return err
 			}
+		}
+		if err := f.dirCache.CheckNamespace(epoch); err != nil {
+			return err
 		}
 		if info.NextCursor == "" {
 			return nil
@@ -601,6 +655,10 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) e
 // ListR lists all objects and directories recursively using the
 // server-side recursive listing. Remotes are rebuilt from parent links.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	epoch := f.dirCache.NamespaceEpoch()
+	if err := f.reconcileDiscovery(ctx, dir, true); err != nil {
+		return err
+	}
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
@@ -608,11 +666,17 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 	opts := &api.MetadataRequestOptions{Limit: f.opt.PageSize, Scope: "recursive"}
 	var items []api.FileInfo
 	for {
+		if err := f.reconcileDiscovery(ctx, dir, true); err != nil {
+			return err
+		}
 		info, err := f.readMetaDataForPath(ctx, dir, opts)
 		if err != nil {
 			if errors.Is(err, fs.ErrorObjectNotFound) {
 				return fs.ErrorDirNotFound
 			}
+			return err
+		}
+		if err := f.dirCache.CheckNamespace(epoch); err != nil {
 			return err
 		}
 		items = append(items, info.Files...)
@@ -627,12 +691,21 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 	}
 	var entries fs.DirEntries
 	flush := func() error {
+		if err := f.reconcileDiscovery(ctx, dir, true); err != nil {
+			return err
+		}
+		if err := f.dirCache.CheckNamespace(epoch); err != nil {
+			return err
+		}
 		if len(entries) == 0 {
 			return nil
 		}
 		batch := entries
 		entries = nil
-		return callback(batch)
+		if err := callback(batch); err != nil {
+			return err
+		}
+		return f.dirCache.CheckNamespace(epoch)
 	}
 	for i := range items {
 		remote, ok := f.recursiveRemote(dir, directoryID, byID, &items[i])
@@ -641,7 +714,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		}
 		switch items[i].Kind {
 		case "folder":
-			f.dirCache.Put(remote, items[i].Id)
+			if err := f.dirCache.PutAtEpoch(remote, items[i].Id, epoch); err != nil {
+				return err
+			}
 			entries = append(entries, fs.NewDir(remote, items[i].ModTime).
 				SetID(items[i].Id).
 				SetParentID(parentIDOrRoot(items[i].ParentId)).
@@ -706,15 +781,26 @@ func (f *Fs) newObjectWithInfo(_ context.Context, remote string, info *api.FileI
 // NewObject finds the Object at remote.  If it can't be found it
 // returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	epoch := f.dirCache.NamespaceEpoch()
+	if err := f.reconcileDiscovery(ctx, remote, false); err != nil {
+		return nil, err
+	}
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
 		}
+		return nil, err
 	}
 
 	res, err := f.findObject(ctx, directoryID, leaf)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.reconcileDiscovery(ctx, remote, false); err != nil {
+		return nil, err
+	}
+	if err := f.dirCache.CheckNamespace(epoch); err != nil {
 		return nil, err
 	}
 	if len(res) == 0 {
@@ -830,19 +916,27 @@ func (f *Fs) updateFileInformation(ctx context.Context, update *api.UpdateFileIn
 	return nil
 }
 
-func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	if src.Size() < 0 {
-		_, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
+		writer, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
 			Open: f, OpenOptions: options,
 		})
-		return err
+		if err != nil {
+			return nil, err
+		}
+		completed, ok := writer.(*objectChunkWriter)
+		if !ok || completed.o == nil {
+			return nil, errAdmissionUnresolved
+		}
+		return completed.o, nil
 	}
-	o := &Object{fs: f}
-	uploadInfo, err := o.uploadMultipart(ctx, src.Remote(), in, src)
+	o := &Object{fs: f, remote: src.Remote()}
+	info, err := o.uploadMultipart(ctx, src.Remote(), in, src)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return o.createFile(ctx, src, uploadInfo)
+	err = o.createFile(ctx, src, info)
+	return o, err
 }
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
@@ -870,6 +964,14 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	admission, err := f.selectUploadAdmission(ctx, "upload", src, src.Remote(), src.Remote(), [32]byte{})
+	if err != nil {
+		return nil, err
+	}
+	if admission.snapshot().request != nil {
+		// Retained retries reconcile the original session before metadata lookup.
+		return f.PutUnchecked(ctx, in, src, options...)
+	}
 	existingObj, err := f.NewObject(ctx, src.Remote())
 	switch err {
 	case nil:
@@ -887,11 +989,48 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	err := f.putUnchecked(ctx, in, src, options...)
+	uploaded, err := f.putUnchecked(ctx, in, src, options...)
 	if err != nil {
-		return nil, err
+		return uploaded, err
 	}
-	return f.NewObject(ctx, src.Remote())
+	original, ok := uploaded.(*Object)
+	if !ok || original.id == "" {
+		return uploaded, errAdmissionUnresolved
+	}
+	resolved, err := f.NewObject(ctx, src.Remote())
+	if err != nil {
+		return uploaded, err
+	}
+	current, ok := resolved.(*Object)
+	if !ok || current.id != original.id {
+		return uploaded, errAdmissionConflict
+	}
+	// Keep the exact guarded publication so the cache can persist its result
+	// and authoritative path before it turns clean.
+	current.guardedResult = original.guardedResult
+	current.generation = original.generation
+	current.guardedEpoch = original.guardedEpoch
+	return resolved, nil
+}
+
+// GuardedWriteResult returns the exact guarded publication of this object.
+func (o *Object) GuardedWriteResult() (fs.GuardedWriteResult, bool) {
+	if o == nil || o.fs == nil || o.guardedResult == nil {
+		return fs.GuardedWriteResult{}, false
+	}
+	entry := o.guardedResult
+	result := fs.GuardedWriteResult{
+		Object: o, ResultID: entry.Id, Generation: strconv.FormatInt(entry.Generation, 10),
+		Size: entry.Size, NamespaceEpoch: o.guardedEpoch,
+	}
+	if entry.Hash != nil {
+		result.Hash = fs.ContentHash{Algorithm: entry.Hash.Algorithm, Value: strings.ToLower(entry.Hash.Value)}
+	}
+	if entry.ParentSegments != nil {
+		result.ParentSegments = append([]string(nil), (*entry.ParentSegments)...)
+		result.LocationKnown = true
+	}
+	return result, true
 }
 
 // Update the already existing object
@@ -901,251 +1040,23 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	if src.Size() < 0 {
-		_, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
-			Open: o.fs, OpenOptions: options,
-		})
+		updated, err := o.fs.putUnchecked(ctx, in, fs.NewOverrideRemote(src, o.Remote()), options...)
 		if err != nil {
 			return err
 		}
-		updated, err := o.fs.NewObject(ctx, o.Remote())
-		if err != nil {
-			return err
+		completed, ok := updated.(*Object)
+		if !ok || completed.id == "" {
+			return errAdmissionUnresolved
 		}
-		*o = *(updated.(*Object))
+		*o = *completed
 		return nil
 	}
 	info, err := o.uploadMultipart(ctx, o.Remote(), in, src)
 	if err != nil {
 		return err
 	}
-	file, err := o.completeUpload(ctx, info)
-	if err != nil {
-		return err
-	}
-	if err := info.setSourceHash(ctx, file); err != nil {
-		return err
-	}
-	o.applyFileInfo(file)
-	return nil
-}
-
-// ChangeNotify calls the passed function with a path that has had changes.
-func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
-	go f.changeNotifyLoop(ctx, notifyFunc, pollIntervalChan, f.changeNotifySSE)
-}
-
-type changeNotifySSEFunc func(context.Context, func(string, fs.EntryType)) error
-
-func (f *Fs) changeNotifyLoop(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration, runSSE changeNotifySSEFunc) {
-	var (
-		enabled   bool
-		sseCancel context.CancelFunc
-		sseDone   <-chan error
-	)
-
-	startSSE := func() {
-		if sseDone != nil {
-			return
-		}
-		sseCtx, cancel := context.WithCancel(ctx)
-		done := make(chan error, 1)
-		sseCancel = cancel
-		sseDone = done
-		fs.Debugf(f, "Starting SSE event stream")
-		go func() {
-			done <- runSSE(sseCtx, notifyFunc)
-		}()
-	}
-	stopSSE := func() {
-		if sseCancel != nil {
-			sseCancel()
-		}
-	}
-	defer stopSSE()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case pollInterval, ok := <-pollIntervalChan:
-			if !ok {
-				fs.Debugf(f, "ChangeNotify: channel closed, stopping")
-				return
-			}
-			enabled = pollInterval > 0
-			if enabled {
-				startSSE()
-			} else {
-				stopSSE()
-			}
-		case err := <-sseDone:
-			sseDone = nil
-			sseCancel = nil
-			if ctx.Err() != nil {
-				return
-			}
-			if !enabled {
-				continue
-			}
-			if err != nil && !errors.Is(err, context.Canceled) {
-				fs.Infof(f, "SSE connection failed permanently: %s", err)
-				return
-			}
-			startSSE()
-		}
-	}
-}
-
-func isFatalError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "401") ||
-		strings.Contains(errStr, "403") ||
-		strings.Contains(errStr, "404")
-}
-
-func (f *Fs) changeNotifySSE(ctx context.Context, notifyFunc func(string, fs.EntryType)) error {
-	lastEventID := ""
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		var connErr error
-		err := f.ssePacer.Call(func() (bool, error) {
-			connErr = f.connectAndProcessSSE(ctx, notifyFunc, &lastEventID)
-			if connErr == nil {
-				return false, nil
-			}
-			if fserrors.ContextError(ctx, &connErr) {
-				return false, connErr
-			}
-			if isFatalError(connErr) {
-				return false, connErr
-			}
-			return true, connErr
-		})
-
-		if err != nil {
-			return err
-		}
-
-		fs.Debugf(f, "SSE connection ended, will retry")
-	}
-}
-
-func (f *Fs) connectAndProcessSSE(ctx context.Context, notifyFunc func(string, fs.EntryType), lastEventID *string) error {
-	headers := map[string]string{
-		"Accept":        "text/event-stream",
-		"Cache-Control": "no-cache",
-	}
-	if lastEventID != nil && *lastEventID != "" {
-		headers["Last-Event-ID"] = *lastEventID
-	}
-	opts := rest.Opts{
-		Method:       "GET",
-		Path:         "/api/v1/events",
-		ContentType:  "text/event-stream",
-		ExtraHeaders: headers,
-		Parameters: url.Values{
-			"types": []string{"file.created,file.updated,file.trashed,file.restored,file.purged"},
-		},
-	}
-	resp, err := f.srv.Call(ctx, &opts)
-	if err != nil {
-		return fmt.Errorf("failed to connect to SSE endpoint: %w", err)
-	}
-	if resp == nil || resp.Body == nil {
-		return fmt.Errorf("no response from SSE endpoint")
-	}
-	defer resp.Body.Close()
-	if contentType := resp.Header.Get("Content-Type"); !strings.Contains(contentType, "text/event-stream") {
-		return fmt.Errorf("unexpected content type: %s", contentType)
-	}
-	fs.Debugf(f, "SSE connection established")
-	reader := bufio.NewReader(resp.Body)
-	var eventID string
-	var eventName string
-	var eventData strings.Builder
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return fmt.Errorf("SSE stream closed by server")
-			}
-			return fmt.Errorf("error reading SSE stream: %w", err)
-		}
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			if eventData.Len() > 0 {
-				data := eventData.String()
-				eventData.Reset()
-				if err := f.processSSEEvent(eventName, data, notifyFunc); err != nil {
-					fs.Debugf(f, "Failed to process SSE event: %s", err)
-				} else if eventID != "" && lastEventID != nil {
-					*lastEventID = eventID
-				}
-			}
-			eventID = ""
-			eventName = ""
-			continue
-		}
-		if after, ok := strings.CutPrefix(line, "id:"); ok {
-			eventID = strings.TrimSpace(after)
-			continue
-		}
-		if after, ok := strings.CutPrefix(line, "event:"); ok {
-			eventName = strings.TrimSpace(after)
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			if eventData.Len() > 0 {
-				eventData.WriteByte('\n')
-			}
-			eventData.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
-}
-
-func (f *Fs) processSSEEvent(eventName, data string, notifyFunc func(string, fs.EntryType)) error {
-	if eventName == "sync.required" {
-		f.dirCache.ResetRoot()
-		notifyFunc("", fs.EntryDirectory)
-		return nil
-	}
-	if eventName == "" || eventName == "stream.error" {
-		return nil
-	}
-	var event api.EventEnvelope
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return fmt.Errorf("failed to unmarshal event: %w", err)
-	}
-	if event.ResourceType != "file" || event.Payload.Name == "" {
-		return nil
-	}
-	parentID := parentIDOrRoot(event.Payload.ParentId)
-	parentPath, ok := f.dirCache.GetInv(parentID)
-	if !ok {
-		return nil
-	}
-	name := f.opt.Enc.ToStandardName(event.Payload.Name)
-	fullPath := path.Join(parentPath, name)
-	entryType := fs.EntryObject
-	if event.Payload.Kind == "folder" {
-		entryType = fs.EntryDirectory
-	}
-	fs.Debugf(f, "SSE event: %s (%v, type=%s)", fullPath, entryType, eventName)
-	notifyFunc(fullPath, entryType)
-	return nil
+	_, err = o.completeUpload(ctx, info)
+	return err
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
@@ -1176,6 +1087,9 @@ func (f *Fs) OpenChunkWriter(
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error) {
+	if err := f.reconcileCreateDir(ctx, pathID, leaf); err != nil {
+		return "", err
+	}
 	opts := rest.Opts{
 		Method:       "POST",
 		Path:         "/api/v1/folders",
@@ -1199,6 +1113,9 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (string, error)
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
+	if err := f.reconcileAdmissions(ctx, nil, "", dir, true); err != nil {
+		return err
+	}
 	_, err = f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
@@ -1261,8 +1178,20 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
-		fs.Debugf(src, "Can't move - not same remote type")
+		fs.Debugf(nil, "Can't move - not same remote type: %T", src)
 		return nil, fs.ErrorCantMove
+	}
+	if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+		primary, usable := intent.Destination.(*Fs)
+		if !usable || intent.Source == nil {
+			return nil, &fs.UploadAdmissionError{Err: errAdmissionUnresolved}
+		}
+		if _, err := primary.CheckUploadAdmission(ctx, intent.Source, intent.DestinationRemote); err != nil {
+			return nil, &fs.UploadAdmissionError{Err: err}
+		}
+	}
+	if err := f.reconcileAdmissions(ctx, srcObj.fs, src.Remote(), remote, false); err != nil {
+		return nil, &fs.UploadAdmissionError{Err: err}
 	}
 
 	srcLeaf, srcParentID, err := srcObj.fs.dirCache.FindPath(ctx, src.Remote(), false)
@@ -1297,8 +1226,11 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	srcFs, ok := src.(*Fs)
 	if !ok {
-		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		fs.Debugf(nil, "Can't move directory - not same remote type: %T", src)
 		return fs.ErrorCantDirMove
+	}
+	if err := f.reconcileAdmissions(ctx, srcFs, srcRemote, dstRemote, true); err != nil {
+		return &fs.UploadAdmissionError{Err: err}
 	}
 	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
@@ -1415,34 +1347,67 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !ok {
 		return nil, fs.ErrorCantCopy
 	}
-	srcLeaf, srcParentID, err := srcObj.fs.dirCache.FindPath(ctx, src.Remote(), false)
+	transport := admissionDigest(struct {
+		Remote       [32]byte
+		Path, FileID string
+	}{srcObj.fs.admissionRemoteIdentity(), admissionSourcePath(srcObj), srcObj.id})
+	requestedRemote := remote
+	if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+		requestedRemote = intent.DestinationRemote
+	}
+	admission, err := f.selectUploadAdmission(ctx, "copy", src, requestedRemote, remote, transport)
 	if err != nil {
 		return nil, err
 	}
-	dstLeaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+	release, err := admission.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if srcParentID == directoryID && dstLeaf == srcLeaf {
-		return nil, fs.ErrorCantCopy
+	defer release()
+	selected := admission.snapshot()
+	if selected.copyRequest == nil {
+		srcLeaf, srcParentID, err := srcObj.fs.dirCache.FindPath(ctx, src.Remote(), false)
+		if err != nil {
+			return nil, err
+		}
+		dstLeaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+		if err != nil {
+			return nil, err
+		}
+		if srcParentID == directoryID && dstLeaf == srcLeaf {
+			return nil, fs.ErrorCantCopy
+		}
+		payload := api.FileCopy{
+			ParentId: requestParentID(directoryID), Name: f.opt.Enc.FromStandardName(dstLeaf), ConflictPolicy: "fail",
+		}
+		if err := admission.freezeCopyRequest(ctx, srcObj.id, payload); err != nil {
+			return nil, err
+		}
+		selected = admission.snapshot()
 	}
 	opts := rest.Opts{
 		Method:       "POST",
-		Path:         "/api/v1/files/" + srcObj.id + "/copy",
-		ExtraHeaders: map[string]string{"Idempotency-Key": uuid.NewString()},
-	}
-	payload := api.FileCopy{
-		ParentId: requestParentID(directoryID), Name: f.opt.Enc.FromStandardName(dstLeaf), ConflictPolicy: "fail",
+		Path:         "/api/v1/files/" + url.PathEscape(selected.copySourceID) + "/copy",
+		ExtraHeaders: map[string]string{"Idempotency-Key": selected.key},
 	}
 	var info api.FileInfo
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, &payload, &info)
+		resp, err := f.srv.CallJSON(ctx, &opts, selected.copyRequest, &info)
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return f.newObjectWithInfo(ctx, remote, &info)
+	result, err := f.newObjectWithInfo(ctx, remote, &info)
+	if err != nil {
+		return nil, err
+	}
+	if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+		if err := f.verifyAdmissionCopy(ctx, intent.Source, result); err != nil {
+			return nil, &fs.UploadAdmissionError{Err: err}
+		}
+	}
+	return result, nil
 }
 
 // About gets quota information
@@ -1582,6 +1547,7 @@ func (o *Object) applyFileInfo(info *api.FileInfo) {
 	o.modTime = info.ModTime
 	o.mimeType = info.MimeType
 	o.hash = fileHashValue(info.Hash)
+	o.generation = info.Generation
 }
 
 func setParentParameter(values url.Values, parentID string) {
