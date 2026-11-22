@@ -16,6 +16,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/atexit"
@@ -42,6 +43,9 @@ type copy struct {
 
 // Used to remove a failed copy
 func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
+	if CheckUploadAdmission(ctx, c.f, c.src, c.remote) != nil {
+		return
+	}
 	if o == nil {
 		return
 	}
@@ -54,6 +58,9 @@ func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
 
 // Used to remove a failed partial copy
 func (c *copy) removeFailedPartialCopy(ctx context.Context, f fs.Fs, remote string) {
+	if CheckUploadAdmission(ctx, c.f, c.src, c.remote) != nil {
+		return
+	}
 	o, err := f.NewObject(ctx, remote)
 	if errors.Is(err, fs.ErrorObjectNotFound) {
 		// Assume object has been deleted
@@ -152,6 +159,9 @@ func (c *copy) serverSideCopy(ctx context.Context) (actionTaken string, newDst f
 	in.ServerSideTransferStart()
 	newCtx, ta := in.NewServerSideCopyAccounter(ctx)
 	newDst, err = doCopy(newCtx, c.src, c.remoteForCopy)
+	if err != nil {
+		err = checkUploadAdmission(ctx, c.f, c.src, c.remote, err)
+	}
 	if err == nil {
 		var n int64
 		if !ta.Started() {
@@ -163,7 +173,7 @@ func (c *copy) serverSideCopy(ctx context.Context) (actionTaken string, newDst f
 		ta.Reset()
 	}
 	_ = in.Close()
-	if errors.Is(err, fs.ErrorCantCopy) {
+	if !fs.IsUploadAdmissionError(err) && errors.Is(err, fs.ErrorCantCopy) {
 		c.tr.Reset(ctx) // skip incomplete accounting - will be overwritten by the manual copy
 	}
 	actionTaken = "Copied (server-side copy)"
@@ -244,7 +254,7 @@ func (c *copy) manualCopy(ctx context.Context) (actionTaken string, newDst fs.Ob
 	// Remove partial files on premature exit
 	if !c.inplace {
 		defer atexit.Unregister(atexit.Register(func() {
-			ctx := context.Background()
+			ctx := fs.CopyConfig(context.Background(), ctx)
 			c.removeFailedPartialCopy(ctx, c.f, c.remoteForCopy)
 		}))
 	}
@@ -266,6 +276,12 @@ func (c *copy) manualCopy(ctx context.Context) (actionTaken string, newDst fs.Ob
 
 	if doMultiThreadCopy(ctx, c.f, c.src) {
 		actionTaken, newDst, err = c.multiThreadCopy(ctx, uploadOptions)
+		if err != nil {
+			err = checkUploadAdmission(ctx, c.f, c.src, c.remote, err)
+			if fs.IsUploadAdmissionError(err) {
+				return actionTaken, newDst, err
+			}
+		}
 		if !errors.Is(err, fs.ErrorRangeIgnored) {
 			return actionTaken, newDst, err
 		}
@@ -311,6 +327,7 @@ func (c *copy) verify(ctx context.Context, newDst fs.Object) (err error) {
 func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	var actionTaken string
 	retry := true
+	manualOnly := false
 	for tries := 0; retry && tries < c.maxTries; tries++ {
 		// Check we haven't hit any accounting limits
 		err = c.checkLimits(ctx)
@@ -319,15 +336,35 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 		}
 
 		// Try server side copy
-		actionTaken, newDst, err = c.serverSideCopy(ctx)
+		if !manualOnly {
+			actionTaken, newDst, err = c.serverSideCopy(ctx)
+			if fs.IsUploadAdmissionError(err) {
+				break
+			}
+		}
 
 		// If can't server-side copy, do it manually
-		if errors.Is(err, fs.ErrorCantCopy) {
+		if manualOnly || errors.Is(err, fs.ErrorCantCopy) {
 			actionTaken, newDst, err = c.manualCopy(ctx)
+			if err != nil {
+				retryable := !fserrors.IsFatalError(err) && !fserrors.IsNoRetryError(err) && !fserrors.IsNoLowLevelRetryError(err) &&
+					(fserrors.IsRetryError(err) || fserrors.ShouldRetry(err))
+				err = checkUploadAdmission(ctx, c.f, c.src, c.remote, err)
+				if fs.IsUploadAdmissionError(err) {
+					if !retryable || fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
+						break
+					}
+					manualOnly = true
+					err = fserrors.RetryError(err)
+				}
+			}
 		}
 
 		// End if ctx is in error
 		if fserrors.ContextError(ctx, &err) {
+			break
+		}
+		if fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
 			break
 		}
 
@@ -352,7 +389,7 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	if err != nil {
 		err = fs.CountError(ctx, err)
 		fs.ErrorfCtx(ctx, c.src, "Failed to copy: %v", err)
-		if !c.inplace {
+		if !c.inplace && !fs.IsUploadAdmissionError(err) {
 			c.removeFailedPartialCopy(ctx, c.f, c.remoteForCopy)
 		}
 		return newDst, err
@@ -361,9 +398,12 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	// Verify the copy
 	err = c.verify(ctx, newDst)
 	if err != nil {
+		err = checkUploadAdmission(ctx, c.f, c.src, c.remote, err)
 		fs.ErrorfCtx(ctx, newDst, "%v", err)
 		err = fs.CountError(ctx, err)
-		c.removeFailedCopy(ctx, newDst)
+		if !fs.IsUploadAdmissionError(err) {
+			c.removeFailedCopy(ctx, newDst)
+		}
 		return nil, err
 	}
 
@@ -371,9 +411,12 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 	if !c.inplace && c.remoteForCopy != c.remote {
 		movedNewDst, err := c.dstFeatures.Move(ctx, newDst, c.remote)
 		if err != nil {
+			err = checkUploadAdmission(ctx, c.f, c.src, c.remote, err)
 			fs.ErrorfCtx(ctx, newDst, "partial file rename failed: %v", err)
 			err = fs.CountError(ctx, err)
-			c.removeFailedCopy(ctx, newDst)
+			if !fs.IsUploadAdmissionError(err) {
+				c.removeFailedCopy(ctx, newDst)
+			}
 			return nil, err
 		}
 		fs.DebugfCtx(ctx, newDst, "renamed to: %s", c.remote)
@@ -395,6 +438,34 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 // It returns the destination object if possible.  Note that this may
 // be nil.
 func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
+	if _, inherited := fs.UploadAdmissionIntentFromContext(ctx); !inherited {
+		ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{Source: src, Destination: f, DestinationRemote: remote})
+	}
+	owner := fs.Info(f)
+	if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+		owner = intent.Destination
+	}
+	if _, aware := owner.(fs.UploadAdmissionChecker); aware {
+		_, durable := fs.UploadAdmissionStoreFromContext(ctx)
+		_, _, transient := fs.UploadAdmissionTransientScopeFromContext(ctx)
+		job := false
+		if cache.JobGetJobID != nil {
+			_, job = cache.JobGetJobID(fs.UploadAdmissionJobContext(ctx))
+		}
+		command := !fs.IsRCRequest(ctx) && fs.GetConfig(ctx).CommandRunID != 0
+		if !durable && !job && !command && !transient {
+			var release context.CancelFunc
+			ctx, release = fs.WithUploadAdmissionTransientScope(ctx)
+			defer release()
+		}
+	}
+	// The one-call owner must not disappear before outer comparison/fallback
+	// consumers can recognize every retained or uncertain failure.
+	defer func() {
+		if err != nil {
+			err = checkUploadAdmission(ctx, f, src, remote, err)
+		}
+	}()
 	ci := fs.GetConfig(ctx)
 	tr := accounting.Stats(ctx).NewTransfer(src, f)
 	defer func() {

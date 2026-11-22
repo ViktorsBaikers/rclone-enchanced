@@ -307,6 +307,9 @@ func (s *syncCopyMove) processError(err error) {
 	}
 	s.errorMu.Lock()
 	defer s.errorMu.Unlock()
+	if fs.IsUploadAdmissionError(err) && !s.aborting() {
+		s.cancel()
+	}
 	switch {
 	case fserrors.IsFatalError(err):
 		if !s.aborting() {
@@ -351,14 +354,26 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 		src := pair.Src
 		var err error
 		tr := accounting.Stats(s.ctx).NewCheckingTransfer(src, "checking")
+		err = operations.CheckUploadAdmission(s.ctx, s.fdst, pair.Src, pair.Src.Remote())
+		if err != nil {
+			s.processError(err)
+			s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, err)
+			tr.Done(s.ctx, err)
+			continue
+		}
 		// Check to see if can store this
 		if src.Storable() {
 			needTransfer := operations.NeedTransfer(s.ctx, pair.Dst, pair.Src)
 			if needTransfer {
-				NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, pair.Dst, pair.Src, s.compareCopyDest, s.backupDir)
+				var NoNeedTransfer bool
+				NoNeedTransfer, err = operations.CompareOrCopyDest(s.ctx, s.fdst, pair.Dst, pair.Src, s.compareCopyDest, s.backupDir, pair.Src.Remote())
 				if err != nil {
 					s.processError(err)
 					s.logger(s.ctx, operations.TransferError, pair.Src, pair.Dst, err)
+					if fs.IsUploadAdmissionError(err) {
+						tr.Done(s.ctx, err)
+						continue
+					}
 				}
 				if NoNeedTransfer {
 					needTransfer = false
@@ -1112,6 +1127,11 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 	case fs.Object:
 		s.logger(s.ctx, operations.MissingOnDst, x, nil, nil)
 		s.markParentNotEmpty(src)
+		if err := operations.CheckUploadAdmission(s.ctx, s.fdst, x, x.Remote()); err != nil {
+			s.processError(err)
+			s.logger(s.ctx, operations.TransferError, x, nil, err)
+			return false
+		}
 
 		if s.trackRenames {
 			// Save object to check for a rename later
@@ -1122,10 +1142,13 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 			}
 		} else {
 			// Check CompareDest && CopyDest
-			NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, nil, x, s.compareCopyDest, s.backupDir)
+			NoNeedTransfer, err := operations.CompareOrCopyDest(s.ctx, s.fdst, nil, x, s.compareCopyDest, s.backupDir, x.Remote())
 			if err != nil {
 				s.processError(err)
 				s.logger(s.ctx, operations.TransferError, x, nil, err)
+				if fs.IsUploadAdmissionError(err) {
+					return false
+				}
 			}
 			if !NoNeedTransfer {
 				// No need to check since doesn't exist

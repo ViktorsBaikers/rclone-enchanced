@@ -66,9 +66,9 @@ type Marcher interface {
 // Note: this will flag filter-aware backends on the source side
 func (m *March) init(ctx context.Context) {
 	ci := fs.GetConfig(ctx)
-	m.srcListDir = m.makeListDir(ctx, m.Fsrc, m.SrcIncludeAll, m.srcKey)
+	m.srcListDir = m.makeListDir(ctx, m.Fsrc, m.SrcIncludeAll, m.srcKey, false)
 	if !m.NoTraverse {
-		m.dstListDir = m.makeListDir(ctx, m.Fdst, m.DstIncludeAll, m.dstKey)
+		m.dstListDir = m.makeListDir(ctx, m.Fdst, m.DstIncludeAll, m.dstKey, true)
 	}
 	// Now create the matching transform
 	// ..normalise the UTF8 first
@@ -129,13 +129,16 @@ func (m *March) dstKey(entry fs.DirEntry) string {
 // ensure listings are cancelled when the march context is cancelled.
 //
 // Note: this will optionally flag filter-aware backends!
-func (m *March) makeListDir(ctx context.Context, f fs.Fs, includeAll bool, keyFn list.KeyFn) listDirFn {
+func (m *March) makeListDir(ctx context.Context, f fs.Fs, includeAll bool, keyFn list.KeyFn, destination bool) listDirFn {
 	ci := fs.GetConfig(ctx)
 	fi := filter.GetConfig(ctx)
 	if !(ci.UseListR && f.Features().ListR != nil) && // !--fast-list active and
 		!(ci.NoTraverse && fi.HaveFilesFrom()) { // !(--files-from and --no-traverse)
 		return func(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 			dirCtx := filter.SetUseFilter(ctx, f.Features().FilterAware && !includeAll) // make filter-aware backends constrain List
+			if destination {
+				dirCtx = fs.WithUploadAdmissionDiscovery(dirCtx, m.Fsrc, nil)
+			}
 			return list.DirSortedFn(dirCtx, f, includeAll, dir, callback, keyFn)
 		}
 	}
@@ -152,6 +155,9 @@ func (m *March) makeListDir(ctx context.Context, f fs.Fs, includeAll bool, keyFn
 		mu.Lock()
 		if !started {
 			dirCtx := filter.SetUseFilter(ctx, f.Features().FilterAware && !includeAll) // make filter-aware backends constrain List
+			if destination {
+				dirCtx = fs.WithUploadAdmissionDiscovery(dirCtx, m.Fsrc, nil)
+			}
 			dirs, dirsErr = walk.NewDirTree(dirCtx, f, m.Dir, includeAll, ci.MaxDepth)
 			started = true
 		}
@@ -410,6 +416,7 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 		dstCtx, dstCancel      = context.WithCancel(m.Ctx)
 	)
 	defer dstCancel()
+	var lookupErrors sync.Map
 
 	// List the src and dst directories
 	if !job.noSrc {
@@ -491,9 +498,14 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 						t.dstMatch <- nil
 						continue
 					}
-					dst, err := m.Fdst.NewObject(m.Ctx, path.Join(job.dstRemote, leaf))
+					sourceRemote := t.src.Remote()
+					discoveryCtx := fs.WithUploadAdmissionDiscovery(m.Ctx, m.Fsrc, &sourceRemote)
+					dst, err := m.Fdst.NewObject(discoveryCtx, path.Join(job.dstRemote, leaf))
 					m.newObjectSem.Release(1)
 					if err != nil {
+						if err != fs.ErrorObjectNotFound || fs.IsUploadAdmissionError(err) {
+							lookupErrors.Store(t.src.Remote(), err)
+						}
 						dst = nil
 					}
 					t.dstMatch <- dst
@@ -525,6 +537,9 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 
 	// Work out what to do and do it
 	err := m.matchListings(srcChan, dstChan, dstCancel, func(src fs.DirEntry) {
+		if _, failed := lookupErrors.Load(src.Remote()); failed {
+			return
+		}
 		recurse := m.Callback.SrcOnly(src)
 		if recurse && job.srcDepth > 0 {
 			jobs = append(jobs, listDirJob{
@@ -561,6 +576,10 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 
 	// Wait for listings to complete and report errors
 	wg.Wait()
+	lookupErrors.Range(func(_, value any) bool {
+		dstListErr = value.(error)
+		return false
+	})
 	if srcListErr != nil {
 		if job.srcRemote != "" {
 			fs.ErrorfCtx(m.Ctx, job.srcRemote, "error reading source directory: %v", srcListErr)
