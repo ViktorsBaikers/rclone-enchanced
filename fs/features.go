@@ -95,6 +95,9 @@ type Features struct {
 	// uses polling, it should adhere to the given interval.
 	ChangeNotify func(context.Context, func(string, EntryType), <-chan time.Duration)
 
+	// ScopedChangeNotify acknowledges a batch only after its memory stale barrier.
+	ScopedChangeNotify func(context.Context, func(ChangeScope) error, <-chan time.Duration)
+
 	// UnWrap returns the Fs that this Fs is wrapping
 	UnWrap func() Fs
 
@@ -310,6 +313,9 @@ func (ft *Features) Fill(ctx context.Context, f Fs) *Features {
 	if do, ok := f.(ChangeNotifier); ok {
 		ft.ChangeNotify = do.ChangeNotify
 	}
+	if do, ok := f.(ScopedChangeNotifier); ok {
+		ft.ScopedChangeNotify = do.ScopedChangeNotify
+	}
 	if do, ok := f.(UnWrapper); ok {
 		ft.UnWrap = do.UnWrap
 	}
@@ -423,6 +429,9 @@ func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 	if mask.ChangeNotify == nil {
 		ft.ChangeNotify = nil
 	}
+	if mask.ScopedChangeNotify == nil {
+		ft.ScopedChangeNotify = nil
+	}
 	// if mask.UnWrap == nil {
 	// 	ft.UnWrap = nil
 	// }
@@ -489,6 +498,11 @@ func (ft *Features) Wrap(f Fs) *Features {
 	if do, ok := f.(Wrapper); ok {
 		ftCopy.WrapFs = do.WrapFs
 		ftCopy.SetWrapper = do.SetWrapper
+	}
+	// A wrapper must implement its own path mapping and acknowledgment.
+	ftCopy.ScopedChangeNotify = nil
+	if do, ok := f.(ScopedChangeNotifier); ok && ft.ScopedChangeNotify != nil {
+		ftCopy.ScopedChangeNotify = do.ScopedChangeNotify
 	}
 	return ftCopy
 }
@@ -578,6 +592,20 @@ type ChangeNotifier interface {
 	// regularly. When the channel gets closed, the implementation
 	// should stop polling and release resources.
 	ChangeNotify(context.Context, func(string, EntryType), <-chan time.Duration)
+}
+
+// ChangeScope identifies cached listings to stale without visiting the origin.
+// An empty path in Parents is the known mount root.
+type ChangeScope struct {
+	All      bool
+	Parents  []string
+	Subtrees []string
+}
+
+// ScopedChangeNotifier is an optional Fs interface for acknowledged changes.
+// Its poll channel has the same lifetime and pause semantics as ChangeNotify.
+type ScopedChangeNotifier interface {
+	ScopedChangeNotify(context.Context, func(ChangeScope) error, <-chan time.Duration)
 }
 
 // EntryType can be associated with remote paths to identify their type
@@ -859,7 +887,11 @@ func UnWrapObject(o Object) Object {
 func UnWrapObjectInfo(oi ObjectInfo) Object {
 	o, ok := oi.(Object)
 	if !ok {
-		return nil
+		u, wraps := oi.(ObjectUnWrapper)
+		if !wraps {
+			return nil
+		}
+		o = u.UnWrap()
 	}
 	return UnWrapObject(o)
 }

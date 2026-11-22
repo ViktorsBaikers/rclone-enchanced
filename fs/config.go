@@ -2,12 +2,14 @@ package fs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -591,6 +593,8 @@ var ConfigOptionsInfo = Options{{
 
 // ConfigInfo is filesystem config options
 type ConfigInfo struct {
+	// CommandRunID identifies one retrying CLI invocation, never a public option.
+	CommandRunID               uint64            `config:"-" json:"-"`
 	LogLevel                   LogLevel          `config:"log_level"`
 	StatsLogLevel              LogLevel          `config:"stats_log_level"`
 	UseJSONLog                 bool              `config:"use_json_log"`
@@ -806,10 +810,141 @@ func (ci *ConfigInfo) TimeoutOrInfinite() time.Duration {
 	return ModTimeNotSupported
 }
 
+var commandRunSequence atomic.Uint64
+
+// NewCommandRunID allocates a process-local, nonzero invocation identity.
+func NewCommandRunID() uint64 {
+	for {
+		previous := commandRunSequence.Load()
+		if previous == ^uint64(0) {
+			panic("command run identity exhausted")
+		}
+		if commandRunSequence.CompareAndSwap(previous, previous+1) {
+			return previous + 1
+		}
+	}
+}
+
 type configContextKeyType struct{}
 
 // Context key for config
 var configContextKey = configContextKeyType{}
+
+// UploadAdmissionState is private dirty-cache evidence, not backend configuration.
+type UploadAdmissionState struct {
+	Generation        string
+	RequestKey        string
+	IntentFingerprint string
+	Request           json.RawMessage `json:",omitempty"`
+	UploadID          string
+}
+
+// UploadAdmissionStore durably compares and saves one dirty generation.
+type UploadAdmissionStore interface {
+	LoadUploadAdmission(context.Context) (UploadAdmissionState, error)
+	StoreUploadAdmission(context.Context, UploadAdmissionState) error
+}
+
+type uploadAdmissionStoreKey struct{}
+
+// WithUploadAdmissionStore attaches the optional per-item journal.
+func WithUploadAdmissionStore(ctx context.Context, store UploadAdmissionStore) context.Context {
+	return context.WithValue(ctx, uploadAdmissionStoreKey{}, store)
+}
+
+// UploadAdmissionStoreFromContext returns the optional per-item journal.
+func UploadAdmissionStoreFromContext(ctx context.Context) (UploadAdmissionStore, bool) {
+	store, ok := ctx.Value(uploadAdmissionStoreKey{}).(UploadAdmissionStore)
+	return store, ok
+}
+
+type uploadAdmissionJobContextKey struct{}
+
+// UploadAdmissionJobContext preserves only the actual job's private identity lookup.
+// Cancellation and all IO must continue to use the current request context.
+func UploadAdmissionJobContext(ctx context.Context) context.Context {
+	if original, ok := ctx.Value(uploadAdmissionJobContextKey{}).(context.Context); ok {
+		return original
+	}
+	return ctx
+}
+
+// UploadAdmissionIntent retains the original source and primary requested target.
+type UploadAdmissionIntent struct {
+	Source            Object
+	Destination       Info
+	DestinationRemote string
+}
+
+type uploadAdmissionIntentKey struct{}
+
+// WithUploadAdmissionIntent carries original intent across transfer wrappers.
+func WithUploadAdmissionIntent(ctx context.Context, intent UploadAdmissionIntent) context.Context {
+	return context.WithValue(ctx, uploadAdmissionIntentKey{}, intent)
+}
+
+// UploadAdmissionIntentFromContext returns the original transfer intent.
+func UploadAdmissionIntentFromContext(ctx context.Context) (UploadAdmissionIntent, bool) {
+	intent, ok := ctx.Value(uploadAdmissionIntentKey{}).(UploadAdmissionIntent)
+	return intent, ok
+}
+
+type uploadAdmissionDiscoveryKey struct{}
+type uploadAdmissionDiscovery struct {
+	source Info
+	remote *string
+}
+
+// WithUploadAdmissionDiscovery marks only destination-role discovery.
+// A nil remote denotes enumeration; a non-nil remote identifies one exact source.
+func WithUploadAdmissionDiscovery(ctx context.Context, source Info, remote *string) context.Context {
+	return context.WithValue(ctx, uploadAdmissionDiscoveryKey{}, uploadAdmissionDiscovery{source, remote})
+}
+
+// UploadAdmissionDiscoveryFromContext returns destination discovery's source binding.
+func UploadAdmissionDiscoveryFromContext(ctx context.Context) (Info, *string, bool) {
+	discovery, ok := ctx.Value(uploadAdmissionDiscoveryKey{}).(uploadAdmissionDiscovery)
+	return discovery.source, discovery.remote, ok
+}
+
+// UploadAdmissionChecker reconciles original work before equality or fallback.
+// Only false, nil positively establishes that no work has been admitted.
+type UploadAdmissionChecker interface {
+	CheckUploadAdmission(context.Context, Object, string) (bool, error)
+}
+
+// UploadAdmissionError prevents fallback and cleanup from discarding uncertain work.
+type UploadAdmissionError struct {
+	Err error
+}
+
+func (e *UploadAdmissionError) Error() string { return e.Err.Error() }
+func (e *UploadAdmissionError) Unwrap() error { return e.Err }
+
+// IsUploadAdmissionError reports source-preserving admission failures through wrappers.
+func IsUploadAdmissionError(err error) bool {
+	var admission *UploadAdmissionError
+	return errors.As(err, &admission)
+}
+
+type uploadAdmissionTransientKey struct{}
+type uploadAdmissionTransientScope struct {
+	id       uint64
+	lifetime context.Context
+}
+
+// WithUploadAdmissionTransientScope owns one rewindable stream's retry lifetime.
+func WithUploadAdmissionTransientScope(ctx context.Context) (context.Context, context.CancelFunc) {
+	lifetime, release := context.WithCancel(ctx)
+	scope := uploadAdmissionTransientScope{NewCommandRunID(), lifetime}
+	return context.WithValue(lifetime, uploadAdmissionTransientKey{}, scope), release
+}
+
+// UploadAdmissionTransientScopeFromContext returns private retry ownership.
+func UploadAdmissionTransientScopeFromContext(ctx context.Context) (uint64, context.Context, bool) {
+	scope, ok := ctx.Value(uploadAdmissionTransientKey{}).(uploadAdmissionTransientScope)
+	return scope.id, scope.lifetime, ok
+}
 
 // GetConfig returns the global or context sensitive context
 func GetConfig(ctx context.Context) *ConfigInfo {
@@ -823,15 +958,27 @@ func GetConfig(ctx context.Context) *ConfigInfo {
 	return c.(*ConfigInfo)
 }
 
-// CopyConfig copies the global config (if any) from srcCtx into
-// dstCtx returning the new context. It also copies the rc request
-// marker if present.
+// CopyConfig copies config and private transfer ownership markers into dstCtx.
+// It preserves dstCtx cancellation, not the original job's cancellation.
 func CopyConfig(dstCtx, srcCtx context.Context) context.Context {
 	if srcCtx == nil {
 		return dstCtx
 	}
 	if IsRCRequest(srcCtx) {
 		dstCtx = WithRCRequest(dstCtx)
+		dstCtx = context.WithValue(dstCtx, uploadAdmissionJobContextKey{}, UploadAdmissionJobContext(srcCtx))
+	}
+	if store, ok := UploadAdmissionStoreFromContext(srcCtx); ok {
+		dstCtx = WithUploadAdmissionStore(dstCtx, store)
+	}
+	if intent, ok := UploadAdmissionIntentFromContext(srcCtx); ok {
+		dstCtx = WithUploadAdmissionIntent(dstCtx, intent)
+	}
+	if source, remote, ok := UploadAdmissionDiscoveryFromContext(srcCtx); ok {
+		dstCtx = WithUploadAdmissionDiscovery(dstCtx, source, remote)
+	}
+	if scope, ok := srcCtx.Value(uploadAdmissionTransientKey{}).(uploadAdmissionTransientScope); ok {
+		dstCtx = context.WithValue(dstCtx, uploadAdmissionTransientKey{}, scope)
 	}
 	c := srcCtx.Value(configContextKey)
 	if c == nil {

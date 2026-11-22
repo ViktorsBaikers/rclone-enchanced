@@ -169,6 +169,8 @@ var (
 	JobGetJobID func(context.Context) (int64, bool)
 	// JobOnFinish for internal use only
 	JobOnFinish func(int64, func()) (func(), error)
+	// JobIsRunning reports whether a retained RC job has not finished.
+	JobIsRunning func(int64) bool
 )
 
 // Get gets an fs.Fs named fsString either from the cache or creates it afresh
