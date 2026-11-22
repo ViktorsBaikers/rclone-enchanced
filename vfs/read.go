@@ -27,6 +27,7 @@ type ReadFileHandle struct {
 	offset      int64 // offset of read of o
 	roffset     int64 // offset of Read() calls
 	file        *File
+	o           fs.Object // pinned at open; the File can be refreshed
 	hash        *hash.MultiHasher
 	remote      string
 	closed      bool // set if handle has been closed
@@ -44,10 +45,9 @@ var (
 	_ io.Closer   = (*ReadFileHandle)(nil)
 )
 
-func newReadFileHandle(f *File) (*ReadFileHandle, error) {
+func newReadFileHandle(f *File, o fs.Object) (*ReadFileHandle, error) {
 	var mhash *hash.MultiHasher
 	var err error
-	o := f.getObject()
 	if !f.VFS().Opt.NoChecksum {
 		hashes := hash.NewHashSet(o.Fs().Hashes().GetOne()) // just pick one hash
 		mhash, err = hash.NewMultiHasherTypes(hashes)
@@ -60,6 +60,7 @@ func newReadFileHandle(f *File) (*ReadFileHandle, error) {
 		remote:      o.Remote(),
 		noSeek:      f.VFS().Opt.NoSeek,
 		file:        f,
+		o:           o,
 		hash:        mhash,
 		size:        nonNegative(o.Size()),
 		sizeUnknown: o.Size() < 0,
@@ -74,13 +75,12 @@ func (fh *ReadFileHandle) openPending() (err error) {
 	if fh.opened {
 		return nil
 	}
-	o := fh.file.getObject()
 	opt := &fh.file.VFS().Opt
-	r, err := chunkedreader.New(fh.file.ctx, o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams).Open()
+	r, err := chunkedreader.New(fh.file.ctx, fh.o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams).Open()
 	if err != nil {
 		return err
 	}
-	tr := accounting.GlobalStats().NewTransfer(o, nil)
+	tr := accounting.GlobalStats().NewTransfer(fh.o, nil)
 	fh.done = tr.Done
 	fh.r = tr.Account(fh.file.ctx, r).WithBuffer() // account the transfer
 	fh.opened = true
@@ -148,9 +148,8 @@ func (fh *ReadFileHandle) seek(offset int64, reopen bool) (err error) {
 			fs.Debugf(fh.remote, "ReadFileHandle.Read seek close old failed: %v", err)
 		}
 		// re-open with a seek
-		o := fh.file.getObject()
 		opt := &fh.file.VFS().Opt
-		r = chunkedreader.New(fh.file.ctx, o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams)
+		r = chunkedreader.New(fh.file.ctx, fh.o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams)
 		_, err := r.Seek(offset, 0)
 		if err != nil {
 			fs.Debugf(fh.remote, "ReadFileHandle.Read seek failed: %v", err)
@@ -350,9 +349,8 @@ func (fh *ReadFileHandle) checkHash() error {
 		return nil
 	}
 
-	o := fh.file.getObject()
 	for hashType, dstSum := range fh.hash.Sums() {
-		srcSum, err := o.Hash(fh.file.ctx, hashType)
+		srcSum, err := fh.o.Hash(fh.file.ctx, hashType)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				// if it was file not found then at

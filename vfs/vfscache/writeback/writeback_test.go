@@ -3,8 +3,16 @@ package writeback
 import (
 	"container/heap"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -12,7 +20,15 @@ import (
 
 	"slices"
 
+	"github.com/google/uuid"
+	"github.com/rclone/rclone/backend/local"
+	"github.com/rclone/rclone/backend/teldrive"
+	"github.com/rclone/rclone/backend/teldrive/api"
+	"github.com/rclone/rclone/backend/teldrive/tdhash"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -781,4 +797,404 @@ func TestWriteBackCancelUpload(t *testing.T) {
 	checkOnHeap(t, wb, wbItem)
 	checkInLookup(t, wb, wbItem)
 	assert.True(t, pi.cancelled)
+}
+
+type b2QueueJournal struct {
+	mu    sync.Mutex
+	state fs.UploadAdmissionState
+}
+
+func (j *b2QueueJournal) LoadUploadAdmission(ctx context.Context) (fs.UploadAdmissionState, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.state, ctx.Err()
+}
+
+func (j *b2QueueJournal) StoreUploadAdmission(ctx context.Context, state fs.UploadAdmissionState) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state.Generation != j.state.Generation {
+		return errors.New("stale generation")
+	}
+	j.state = state
+	return nil
+}
+
+func TestB2VFSAdmissionRetry(t *testing.T) {
+	for _, mode := range []string{"lost_create_ack", "truncated_terminal_restore", "fresh_fs_objects", "dirty_generation_new_intent",
+		"unchanged_requeue", "retained_dirty_bytes", "legacy_unknown_retains_dirty"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			ctx, ci := fs.AddConfig(ctx)
+			ci.LowLevelRetries, ci.Transfers = 1, 2
+			ci.MultiThreadStreams = 0
+			opt := vfscommon.Opt
+			opt.WriteBack = fs.Duration(24 * time.Hour)
+			wb := New(ctx, &opt)
+			root := t.TempDir()
+			path := filepath.Join(root, "source.txt")
+			require.NoError(t, os.WriteFile(path, []byte("data"), 0600))
+			source, err := local.NewFs(ctx, "local", root, configmap.Simple{})
+			require.NoError(t, err)
+			journal := &b2QueueJournal{state: fs.UploadAdmissionState{Generation: uuid.NewString()}}
+			var mu sync.Mutex
+			keys := make(map[string]bool)
+			var request api.UploadCreateRequest
+			var session api.UploadSession
+			var resultFile *api.FileInfo
+			var createKey string
+			creates, folders, publications, selectedGets := 0, 0, 0, 0
+			restored, permitNew := false, false
+			partStarted := make(chan struct{})
+			blocked := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				refuse := func() {
+					w.WriteHeader(409)
+					if mode == "truncated_terminal_restore" {
+						_, _ = io.WriteString(w, `{"error":`)
+					} else if mode == "legacy_unknown_retains_dirty" {
+						_, _ = io.WriteString(w, `{"error":{"code":"conflict","message":"legacy destination unknown"}}`)
+					} else {
+						_, _ = io.WriteString(w, `{"error":{"code":"upload_parent_unavailable","message":"destination unavailable"}}`)
+					}
+				}
+				switch {
+				case r.URL.Path == "/api/v1/me":
+					_ = json.NewEncoder(w).Encode(api.UserProfile{UserId: 42})
+				case r.Method == "GET" && r.URL.Path == "/api/v1/files":
+					page := api.ReadMetadataResponse{}
+					if resultFile != nil {
+						page.Files = []api.FileInfo{*resultFile}
+					}
+					_ = json.NewEncoder(w).Encode(page)
+				case r.Method == "GET" && r.URL.Path == "/api/v1/uploads":
+					_ = json.NewEncoder(w).Encode(api.UploadSessionPage{Items: []api.UploadSession{}})
+				case r.Method == "POST" && r.URL.Path == "/api/v1/uploads":
+					var incoming api.UploadCreateRequest
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&incoming))
+					key := r.Header.Get("Idempotency-Key")
+					state, err := journal.LoadUploadAdmission(ctx)
+					require.NoError(t, err)
+					require.Equal(t, key, state.RequestKey)
+					require.NotEmpty(t, state.Request)
+					if !keys[key] {
+						keys[key] = true
+						creates++
+						createKey, request = key, incoming
+						session = api.UploadSession{ID: uuid.NewString(), Name: incoming.Name, ParentId: incoming.ParentId,
+							ExpectedSize: incoming.Size, MimeType: incoming.MimeType, ModTime: incoming.ModTime,
+							Encryption: incoming.Encryption, ConflictPolicy: incoming.ConflictPolicy, State: "open",
+							ExpiresAt: time.Now().Add(time.Hour), PartSize: tdhash.BlockSize, RequiresCompletionManifest: true}
+					} else {
+						require.Equal(t, request, incoming)
+					}
+					if mode == "lost_create_ack" && !permitNew {
+						if !restored {
+							_, _ = io.WriteString(w, `{"id":`)
+							return
+						}
+						refuse()
+						return
+					}
+					_ = json.NewEncoder(w).Encode(session)
+				case r.Method == "GET" && r.URL.Path == "/api/v1/uploads/"+session.ID:
+					selectedGets++
+					refuse()
+				case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/parts"):
+					_ = json.NewEncoder(w).Encode(api.UploadPartPage{Items: []api.UploadPart{}})
+				case r.Method == "PUT" && strings.Contains(r.URL.Path, "/parts/"):
+					state, err := journal.LoadUploadAdmission(ctx)
+					require.NoError(t, err)
+					require.Equal(t, session.ID, state.UploadID)
+					if mode == "retained_dirty_bytes" && !blocked && !permitNew {
+						blocked = true
+						if _, err := io.Copy(io.Discard, r.Body); err != nil {
+							return
+						}
+						close(partStarted)
+						select {
+						case <-r.Context().Done():
+						case <-ctx.Done():
+						}
+						return
+					}
+					if !permitNew {
+						refuse()
+						return
+					}
+					body, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					_ = json.NewEncoder(w).Encode(api.UploadPart{UploadId: session.ID, PartNo: 1, State: "stored",
+						PlainSize: int64(len(body)), Checksum: tdhash.SumString(body)})
+				case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/complete"):
+					var manifest api.UploadCompleteRequest
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&manifest))
+					publications++
+					resultFile = &api.FileInfo{Id: "winner", Kind: "file", Name: request.Name,
+						Size: manifest.Size, Hash: manifest.Hash, ModTime: request.ModTime}
+					_ = json.NewEncoder(w).Encode(resultFile)
+				case r.URL.Path == "/api/v1/folders":
+					folders++
+					w.WriteHeader(409)
+				default:
+					t.Errorf("unexpected queue request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(400)
+				}
+			}))
+			defer server.Close()
+			attempts := make(chan error, 8)
+			put := func(requestCtx context.Context) error {
+				requestCtx = fs.WithUploadAdmissionStore(requestCtx, journal)
+				requestCtx = fs.CopyConfig(requestCtx, fs.CopyConfig(requestCtx, requestCtx))
+				fresh, err := teldrive.NewFs(requestCtx, "b2-queue", "", configmap.Simple{
+					"api_host": server.URL, "api_key": "synthetic-key", "chunk_size": "16Mi"})
+				if err == nil {
+					src, getErr := source.NewObject(requestCtx, "source.txt")
+					err = getErr
+					if err == nil {
+						_, err = operations.Copy(requestCtx, fresh, nil, "file.txt", src)
+					}
+				}
+				attempts <- err
+				return err
+			}
+			id := wb.Add(0, "file.txt", 4, true, put)
+			next := func() error {
+				require.NoError(t, wb.SetExpiry(id, time.Now(), 0))
+				select {
+				case err := <-attempts:
+					require.Eventually(t, func() bool { n, _ := wb.Stats(); return n == 0 }, time.Second, time.Millisecond)
+					return err
+				case <-ctx.Done():
+					t.Fatal("real writeback did not run")
+					return ctx.Err()
+				}
+			}
+			if mode == "retained_dirty_bytes" {
+				require.NoError(t, wb.SetExpiry(id, time.Now(), 0))
+				select {
+				case <-partStarted:
+				case <-ctx.Done():
+					t.Fatal("queue never started the cancelable part")
+				}
+				require.True(t, wb.cancelUpload(id))
+				select {
+				case err := <-attempts:
+					require.ErrorIs(t, err, context.Canceled)
+				case <-ctx.Done():
+					t.Fatal("queue cancellation did not finish")
+				}
+			} else {
+				require.Error(t, next())
+			}
+			original, err := journal.LoadUploadAdmission(ctx)
+			require.NoError(t, err)
+			mu.Lock()
+			restored = true
+			firstKey := createKey
+			mu.Unlock()
+			if mode == "unchanged_requeue" {
+				wb.Add(id, "file.txt", 4, false, put)
+			}
+			require.Error(t, next())
+			unchanged, err := journal.LoadUploadAdmission(ctx)
+			require.NoError(t, err)
+			require.Equal(t, original, unchanged)
+			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Equal(t, sha256.Sum256([]byte("data")), sha256.Sum256(got))
+			mu.Lock()
+			require.Equal(t, 1, creates)
+			require.Zero(t, folders)
+			require.Zero(t, publications)
+			mu.Unlock()
+			// Cancel the old queue writer before creating explicit new content.
+			wb.Remove(id)
+			require.NoError(t, os.WriteFile(path, []byte("DATA"), 0600))
+			journal.mu.Lock()
+			journal.state = fs.UploadAdmissionState{Generation: uuid.NewString()}
+			journal.mu.Unlock()
+			mu.Lock()
+			permitNew = true
+			mu.Unlock()
+			id = wb.Add(0, "file.txt", 4, true, put)
+			require.NoError(t, next())
+			mu.Lock()
+			require.NotEqual(t, firstKey, createKey)
+			require.Equal(t, 2, creates)
+			require.Equal(t, 1, publications)
+			if mode == "legacy_unknown_retains_dirty" {
+				require.Positive(t, selectedGets)
+			}
+			mu.Unlock()
+			require.Equal(t, fs.Duration(24*time.Hour), opt.WriteBack)
+		})
+	}
+}
+
+// TestB3DirtyWriteBackHeld proves a typed held disposition is never retried
+// and never reported as success.
+func TestB3DirtyWriteBackHeld(t *testing.T) {
+	wb, cancel := newTestWriteBack(t)
+	defer cancel()
+
+	calls := 0
+	id := wb.Add(0, "held", 4, true, func(context.Context) error {
+		calls++
+		return &HeldError{Reason: "guarded destination conflict"}
+	})
+	require.Eventually(t, func() bool {
+		wb.mu.Lock()
+		defer wb.mu.Unlock()
+		return wb.lookup[id] != nil && wb.lookup[id].held != ""
+	}, time.Second, time.Millisecond)
+	waitUntilNoTransfers(t, wb)
+
+	wbItem := wb.lookup[id]
+	checkNotOnHeap(t, wb, wbItem)
+	checkInLookup(t, wb, wbItem)
+	require.Contains(t, wbItem.held, "guarded destination conflict")
+
+	// Expiry and a new write cannot make held work runnable again.
+	require.NoError(t, wb.SetExpiry(id, time.Now(), 0))
+	wb.Add(id, "held", 8, true, func(context.Context) error { calls++; return nil })
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 1, calls)
+
+	queue := wb.Queue()
+	require.Len(t, queue, 1)
+	require.NotEmpty(t, queue[0].Held)
+	require.False(t, queue[0].Uploading)
+}
+
+// b4LogSink captures rclone log records for the duration of a test.
+type b4LogSink struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *b4LogSink) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *b4LogSink) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *b4LogSink) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *b4LogSink) WithGroup(string) slog.Handler { return h }
+
+func (h *b4LogSink) contains(substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// b4DebugLogs enables debug logging for the test and restores the level.
+func b4DebugLogs(t *testing.T) {
+	t.Helper()
+	cfg := fs.GetConfig(context.Background())
+	old := cfg.LogLevel
+	cfg.LogLevel = fs.LogLevelDebug
+	t.Cleanup(func() { fs.GetConfig(context.Background()).LogLevel = old })
+}
+
+// TestB4FatalWriteBackNotRetried proves a fatal accounting stop or a
+// cancellation is attempted once and never rescheduled, while an ordinary
+// error keeps the existing retry behaviour.
+func TestB4FatalWriteBackNotRetried(t *testing.T) {
+	b4DebugLogs(t)
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"fatal", accounting.ErrorMaxTransferLimitReachedFatal},
+		{"canceled", context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wb, cancel := newTestWriteBack(t)
+			defer cancel()
+			sink := &b4LogSink{}
+			fs.SetLogger(sink)
+
+			var mu sync.Mutex
+			calls := 0
+			id := wb.Add(0, "terminal", 4, true, func(context.Context) error {
+				mu.Lock()
+				defer mu.Unlock()
+				calls++
+				return test.err
+			})
+			require.Eventually(t, func() bool {
+				wb.mu.Lock()
+				defer wb.mu.Unlock()
+				return wb.lookup[id] != nil && wb.lookup[id].tries == 1 && !wb.lookup[id].uploading
+			}, time.Second, time.Millisecond)
+			waitUntilNoTransfers(t, wb)
+
+			wbItem := wb.lookup[id]
+			checkNotOnHeap(t, wb, wbItem)
+			checkInLookup(t, wb, wbItem)
+			assert.Empty(t, wbItem.held)
+
+			// More than two delay intervals must not schedule another attempt.
+			time.Sleep(250 * time.Millisecond)
+			mu.Lock()
+			got := calls
+			mu.Unlock()
+			require.Equal(t, 1, got)
+			wb.mu.Lock()
+			tries := wbItem.tries
+			wb.mu.Unlock()
+			assert.Equal(t, 1, tries)
+			checkNotOnHeap(t, wb, wbItem)
+			assert.True(t, sink.contains("upload aborted terminally"))
+			assert.False(t, sink.contains("upload succeeded"))
+		})
+	}
+
+	t.Run("transient-retries", func(t *testing.T) {
+		wb, cancel := newTestWriteBack(t)
+		defer cancel()
+		sink := &b4LogSink{}
+		fs.SetLogger(sink)
+
+		var mu sync.Mutex
+		calls := 0
+		id := wb.Add(0, "transient", 4, true, func(context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if calls >= 2 {
+				return nil
+			}
+			return errors.New("transient outage")
+		})
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls >= 2
+		}, 2*time.Second, 5*time.Millisecond)
+		waitUntilNoTransfers(t, wb)
+
+		wb.mu.Lock()
+		finished := wb.lookup[id] == nil
+		wb.mu.Unlock()
+		require.True(t, finished)
+		assert.True(t, sink.contains("upload succeeded"))
+	})
 }

@@ -178,19 +178,21 @@ var (
 
 // VFS represents the top level filing system
 type VFS struct {
-	f           fs.Fs
-	ctx         context.Context
-	root        *Dir
-	Opt         vfscommon.Options
-	cache       *vfscache.Cache
-	cancel      context.CancelFunc
-	cancelCache context.CancelFunc
-	usageMu     sync.Mutex
-	usageTime   time.Time
-	usage       *fs.Usage
-	pollMu      sync.Mutex
-	pollChan    chan time.Duration
-	inUse       atomic.Int32 // count of number of opens
+	f                fs.Fs
+	ctx              context.Context
+	root             *Dir
+	Opt              vfscommon.Options
+	cache            *vfscache.Cache
+	cancel           context.CancelFunc
+	cancelCache      context.CancelFunc
+	releaseCacheRoot func()
+	usageMu          sync.Mutex
+	usageTime        time.Time
+	usage            *fs.Usage
+	pollMu           sync.Mutex
+	pollChan         chan time.Duration
+	namespace        *dirNamespace // only for backends with scoped notifications
+	inUse            atomic.Int32  // count of number of opens
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -250,7 +252,12 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 
 	// Start polling function
 	features := vfs.f.Features()
-	if do := features.ChangeNotify; do != nil {
+	if do := features.ScopedChangeNotify; do != nil {
+		vfs.namespace = &dirNamespace{listed: make(map[string]uint64)}
+		vfs.pollChan = make(chan time.Duration)
+		do(vfs.ctx, vfs.namespace.invalidate, vfs.pollChan)
+		vfs.pollChan <- time.Duration(vfs.Opt.PollInterval)
+	} else if do := features.ChangeNotify; do != nil {
 		vfs.pollChan = make(chan time.Duration)
 		do(vfs.ctx, vfs.root.changeNotify, vfs.pollChan)
 		vfs.pollChan <- time.Duration(vfs.Opt.PollInterval)
@@ -385,11 +392,26 @@ func (vfs *VFS) SetCacheMode(cacheMode vfscommon.CacheMode) {
 		vfs.Opt.CacheMode = cacheMode
 		vfs.cancelCache = cancel
 		vfs.cache = cache
+		// Restart-held guarded generations must be visible and resolved before
+		// anything else serves; nothing is queued or sent before this.
+		cache.SetLocalAdd(vfs.AddLocalVirtual)
+		cache.ReconcileGuarded(vfs.ctx)
+		// Offline quarantine takes the exclusive form of this same lock, so a
+		// running client refuses separation instead of losing held bytes.
+		if release, lockErr := vfscache.HoldCacheRoot(cache.DedicatedRootOSPath()); lockErr == nil {
+			vfs.releaseCacheRoot = release
+		} else {
+			fs.Debugf(nil, "vfs cache: root lock not taken: %v", lockErr)
+		}
 	}
 }
 
 // shutdown the cache if it was running
 func (vfs *VFS) shutdownCache() {
+	if vfs.releaseCacheRoot != nil {
+		vfs.releaseCacheRoot()
+		vfs.releaseCacheRoot = nil
+	}
 	if vfs.cancelCache != nil {
 		vfs.cancelCache()
 		vfs.cancelCache = nil
@@ -946,6 +968,49 @@ func (vfs *VFS) AddVirtual(remote string, size int64, isDir bool) (err error) {
 		return err
 	}
 	dir.AddVirtual(leaf, size, isDir)
+	return nil
+}
+
+// AddLocalVirtual publishes a local-only entry for a held guarded generation.
+//
+// It never lists, creates or follows anything on the remote: a vanished or
+// file-valued ancestor becomes a local overlay directory instead. The
+// directory stays stale, so its listing is never reported as a success.
+func (vfs *VFS) AddLocalVirtual(remote string, size int64) error {
+	remote = strings.Trim(remote, "/")
+	if remote == "" {
+		return nil
+	}
+	segments := strings.Split(remote, "/")
+	dir := vfs.root
+	for i, leaf := range segments {
+		dir.mu.Lock()
+		if i == len(segments)-1 {
+			if file, ok := dir.items[leaf].(*File); ok {
+				file.setSize(size)
+				dir._addLocalNode(leaf, file)
+				dir.mu.Unlock()
+				return nil
+			}
+			file := newFile(dir, dir.path, nil, leaf)
+			file.setSize(size)
+			dir._addLocalNode(leaf, file)
+			dir.mu.Unlock()
+			return nil
+		}
+		child, ok := dir.items[leaf].(*Dir)
+		if !ok {
+			child = newDir(vfs, vfs.f, dir, fs.NewDir(path.Join(dir.path, leaf), time.Now()))
+			dir._addLocalNode(leaf, child)
+		} else {
+			if dir.local == nil {
+				dir.local = make(map[string]struct{})
+			}
+			dir.local[leaf] = struct{}{}
+		}
+		dir.mu.Unlock()
+		dir = child
+	}
 	return nil
 }
 

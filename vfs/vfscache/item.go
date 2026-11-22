@@ -1,15 +1,19 @@
 package vfscache
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/operations"
@@ -56,31 +60,48 @@ import (
 // The Info field is written to the backing store to store status
 type Item struct {
 	// read only
-	c               *Cache                   // cache this is part of
-	mu              sync.Mutex               // protect the variables
-	cond            sync.Cond                // synchronize with cache cleaner
-	name            string                   // name in the VFS
-	opens           int                      // number of times file is open
-	downloaders     *downloaders.Downloaders // a record of the downloaders in action - may be nil
-	o               fs.Object                // object we are caching - may be nil
-	fd              *os.File                 // handle we are using to read and write to the file
-	info            Info                     // info about the file to persist to backing store
-	writeBackID     writeback.Handle         // id of any writebacks in progress
-	pendingAccesses int                      // number of threads - cache reset not allowed if not zero
-	modified        bool                     // set if the file has been modified since the last Open
-	beingReset      bool                     // cache cleaner is resetting the cache file, access not allowed
-	graceTimer      *time.Timer              // timer for delayed close after grace period
-	closing         chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	c                 *Cache                   // cache this is part of
+	mu                sync.Mutex               // protect the variables
+	mutation          sync.Mutex               // serialize marker-through-clear local mutation across handles
+	cond              sync.Cond                // synchronize with cache cleaner
+	name              string                   // name in the VFS
+	opens             int                      // number of times file is open
+	downloaders       *downloaders.Downloaders // a record of the downloaders in action - may be nil
+	o                 fs.Object                // object we are caching - may be nil
+	fd                *os.File                 // handle we are using to read and write to the file
+	info              Info                     // info about the file to persist to backing store
+	writeBackID       writeback.Handle         // id of any writebacks in progress
+	pendingAccesses   int                      // number of threads - cache reset not allowed if not zero
+	modified          bool                     // set if the file has been modified since the last Open
+	beingReset        bool                     // cache cleaner is resetting the cache file, access not allowed
+	graceTimer        *time.Timer              // timer for delayed close after grace period
+	closing           chan struct{}            // non-nil while a grace-period close is tearing the handle down, closed when done
+	admissionChanging bool                     // old writer is being canceled before new intent
+	admissionErr      error                    // retain uncertain metadata instead of deleting data
+	admissionUnsaved  bool                     // retry only failed journal saves before admission
+	admissionFrozen   bool                     // a further write must not reuse admitted content
+	writeWasDirty     bool
+	storeCancel       context.CancelFunc
+	storeDone         chan struct{}
+	guardActive       bool // the remote requires guarded writes
+	guardJournal      *fs.GuardedWriteJournal
+	guardHeld         string // sticky non-runnable reason
+	mutationUncertain bool   // a local mutation marker outlived its data sync
 }
 
 // Info is persisted to backing store
 type Info struct {
-	ModTime     time.Time     // last time file was modified
-	ATime       time.Time     // last time file was accessed
-	Size        int64         // size of the file
-	Rs          ranges.Ranges // which parts of the file are present
-	Fingerprint string        // fingerprint of remote object
-	Dirty       bool          // set if the backing file has been modified
+	ModTime          time.Time       // last time file was modified
+	ATime            time.Time       // last time file was accessed
+	Size             int64           // size of the file
+	Rs               ranges.Ranges   // which parts of the file are present
+	Fingerprint      string          // fingerprint of remote object
+	Dirty            bool            // set if the backing file has been modified
+	UploadGeneration string          `json:",omitempty"`
+	UploadAdmission  json.RawMessage `json:",omitempty"` // validate only through the optional store
+	UploadGuard      json.RawMessage `json:",omitempty"` // versioned guarded write journal
+	MutationMarker   string          `json:",omitempty"` // generation of in-flight local mutation
+	GuardHold        string          `json:",omitempty"` // sticky non-runnable reason
 }
 
 // Items are a slice of *Item ordered by ATime
@@ -146,25 +167,35 @@ func newItem(c *Cache, name string) (item *Item) {
 	// check the cache file exists
 	osPath := c.toOSPath(name)
 	fi, statErr := os.Stat(osPath)
-	if statErr != nil {
-		if os.IsNotExist(statErr) {
-			item._removeMeta("cache file doesn't exist")
-		} else {
-			item.remove(fmt.Sprintf("failed to stat cache file: %v", statErr))
-		}
-	}
 
 	// Try to load the metadata
 	exists, err := item.load()
 	if !exists {
 		item._removeFile("metadata doesn't exist")
 	} else if err != nil {
-		item.remove(fmt.Sprintf("failed to load metadata: %v", err))
+		// Uncertain metadata may contain the only selected remote admission.
+		item.info.Dirty = true
+		item.admissionErr = err
+		fs.Errorf(name, "vfs cache: retaining unreadable metadata: %v", err)
+	}
+	if statErr != nil && exists {
+		if item.info.Dirty || len(item.info.UploadAdmission) != 0 {
+			item.info.Dirty = true
+			item.admissionErr = fmt.Errorf("vfs cache: retaining unavailable dirty source: %w", statErr)
+		} else if os.IsNotExist(statErr) {
+			item._removeMeta("clean cache file doesn't exist")
+		} else {
+			item.remove(fmt.Sprintf("failed to stat clean cache file: %v", statErr))
+		}
 	}
 
 	// Get size estimate (which is best we can do until Open() called)
 	if statErr == nil {
 		item.info.Size = fi.Size()
+	}
+	if guard, ok := c.fremote.(fs.GuardedWriteFs); ok && guard.GuardedWriteEnabled() {
+		item.guardActive = true
+		item._loadGuard()
 	}
 	return item
 }
@@ -191,7 +222,7 @@ func (item *Item) load() (exists bool, err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	in, err := os.Open(osPathMeta)
+	in, err := file.Open(osPathMeta)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, err
@@ -211,19 +242,649 @@ func (item *Item) load() (exists bool, err error) {
 //
 // call with the lock held
 func (item *Item) _save() (err error) {
+	defer func() { item.admissionUnsaved = err != nil }()
+	if item.admissionErr != nil {
+		return item.admissionErr
+	}
 	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
-	out, err := os.Create(osPathMeta)
+	out, err := os.CreateTemp(filepath.Dir(osPathMeta), ".admission-*")
 	if err != nil {
 		return fmt.Errorf("vfs cache item: failed to write metadata: %w", err)
 	}
-	defer fs.CheckClose(out, &err)
+	defer func() {
+		_ = out.Close()
+		_ = os.Remove(out.Name())
+	}()
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "\t")
-	err = encoder.Encode(item.info)
-	if err != nil {
+	if err = encoder.Encode(item.info); err != nil {
 		return fmt.Errorf("vfs cache item: failed to encode metadata: %w", err)
 	}
+	if err = out.Sync(); err != nil {
+		return fmt.Errorf("vfs cache item: failed to sync metadata: %w", err)
+	}
+	if err = out.Close(); err != nil {
+		return fmt.Errorf("vfs cache item: failed to close metadata: %w", err)
+	}
+	if err = os.Rename(out.Name(), osPathMeta); err != nil {
+		return fmt.Errorf("vfs cache item: failed to replace metadata: %w", err)
+	}
 	return nil
+}
+
+// A store is bound to the captured generation, never to the next user write.
+type itemAdmissionStore struct {
+	item       *Item
+	generation string
+}
+
+func (item *Item) admissionStore() fs.UploadAdmissionStore {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return &itemAdmissionStore{item: item, generation: item.info.UploadGeneration}
+}
+
+func (store *itemAdmissionStore) load(ctx context.Context) (fs.UploadAdmissionState, error) {
+	item := store.item
+	if err := ctx.Err(); err != nil {
+		return fs.UploadAdmissionState{}, err
+	}
+	if item.admissionErr != nil {
+		return fs.UploadAdmissionState{}, item.admissionErr
+	}
+	if item.admissionChanging || store.generation == "" || item.info.UploadGeneration != store.generation {
+		return fs.UploadAdmissionState{}, errors.New("vfs cache: unavailable or stale upload generation")
+	}
+	var state fs.UploadAdmissionState
+	decoder := json.NewDecoder(bytes.NewReader(item.info.UploadAdmission))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil {
+		return state, fmt.Errorf("vfs cache: invalid upload admission: %w", err)
+	}
+	if state.Generation != store.generation {
+		return state, errors.New("vfs cache: upload admission generation mismatch")
+	}
+	return state, nil
+}
+
+func (store *itemAdmissionStore) LoadUploadAdmission(ctx context.Context) (fs.UploadAdmissionState, error) {
+	store.item.mu.Lock()
+	defer store.item.mu.Unlock()
+	state, err := store.load(ctx)
+	if err != nil {
+		return state, err
+	}
+	// A prior dirty-marker save may have failed; no remote send may bypass it.
+	if store.item.admissionUnsaved {
+		return state, store.item._save()
+	}
+	return state, nil
+}
+
+func (store *itemAdmissionStore) StoreUploadAdmission(ctx context.Context, state fs.UploadAdmissionState) error {
+	item := store.item
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	previous, err := store.load(ctx)
+	if err != nil {
+		return err
+	}
+	if state.Generation != previous.Generation ||
+		(previous.RequestKey != "" && (previous.RequestKey != state.RequestKey ||
+			previous.IntentFingerprint != state.IntentFingerprint || string(previous.Request) != string(state.Request))) ||
+		(previous.UploadID != "" && previous.UploadID != state.UploadID) {
+		return errors.New("vfs cache: conflicting upload admission")
+	}
+	body, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	old := item.info.UploadAdmission
+	item.info.UploadAdmission = body
+	if err = item._save(); err != nil {
+		item.info.UploadAdmission = old
+	} else if state.RequestKey != "" {
+		item.admissionFrozen = true
+	}
+	return err
+}
+
+func (item *Item) _newUploadGeneration() {
+	item.info.UploadGeneration = uuid.NewString()
+	body, _ := json.Marshal(fs.UploadAdmissionState{Generation: item.info.UploadGeneration})
+	item.info.UploadAdmission = body
+	item.admissionErr = nil
+	item.admissionFrozen = false
+}
+
+// _loadGuard restores the durable guarded journal and any interrupted local
+// mutation. Old, malformed or path-only proof stays held, never runnable.
+//
+// Called once during construction before the item is published.
+func (item *Item) _loadGuard() {
+	if item.info.GuardHold != "" {
+		item.guardHeld = item.info.GuardHold
+	}
+	if item.info.MutationMarker != "" {
+		item.mutationUncertain = true
+		if item.guardHeld == "" {
+			item.guardHeld = "vfs cache: uncertain local mutation"
+		}
+		// The saved ranges describe the bytes before the interrupted write.
+		// They are not proof for the bytes now on disk.
+		item.info.Rs = nil
+	}
+	if len(item.info.UploadGuard) != 0 {
+		var journal fs.GuardedWriteJournal
+		decoder := json.NewDecoder(bytes.NewReader(item.info.UploadGuard))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&journal); err != nil || journal.Version != fs.GuardedWriteJournalVersion {
+			if item.guardHeld == "" {
+				item.guardHeld = "vfs cache: unreadable guarded journal"
+			}
+		} else {
+			item.guardJournal = &journal
+			if journal.Reason != "" && item.guardHeld == "" {
+				item.guardHeld = journal.Reason
+			}
+			if journal.Generation != item.info.UploadGeneration && item.guardHeld == "" {
+				item.guardHeld = "vfs cache: guarded journal generation mismatch"
+			}
+		}
+	} else if item.info.Dirty && item.guardHeld == "" {
+		item.guardHeld = "vfs cache: missing guarded journal"
+	}
+	if item.guardHeld != "" {
+		item.info.GuardHold = item.guardHeld
+		if item.guardJournal != nil {
+			item.guardJournal.Reason = item.guardHeld
+		}
+	}
+}
+
+// HeldReason returns the sticky non-runnable reason, if any.
+func (item *Item) HeldReason() string {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.guardHeld
+}
+
+// _heldErrorLocked records a definitive hold and returns a queue disposition
+// which can never fall into generic retry or success.
+//
+// Call with item.mu held.
+func (item *Item) _heldErrorLocked(reason string) error {
+	if reason == "" {
+		reason = "vfs cache: guarded write is held"
+	}
+	item.guardHeld = reason
+	item.info.GuardHold = reason
+	if item.guardJournal != nil {
+		item.guardJournal.Reason = reason
+		_ = item._saveGuardLocked()
+	}
+	if err := item._save(); err != nil {
+		fs.Errorf(item.name, "vfs cache: failed to persist held reason: %v", err)
+	}
+	return &writeback.HeldError{Reason: reason}
+}
+
+// _saveGuardLocked serialises the guarded journal into the persisted info.
+//
+// Call with item.mu held.
+func (item *Item) _saveGuardLocked() error {
+	if item.guardJournal == nil {
+		return nil
+	}
+	body, err := json.Marshal(item.guardJournal)
+	if err != nil {
+		return err
+	}
+	item.info.UploadGuard = body
+	return nil
+}
+
+// _admissionStateLocked decodes the current B2 admission for the journal.
+//
+// Call with item.mu held.
+func (item *Item) _admissionStateLocked() (fs.UploadAdmissionState, bool) {
+	var state fs.UploadAdmissionState
+	if len(item.info.UploadAdmission) == 0 {
+		return state, false
+	}
+	if err := json.Unmarshal(item.info.UploadAdmission, &state); err != nil || state.Generation != item.info.UploadGeneration {
+		return state, false
+	}
+	return state, true
+}
+
+// _beginMutation durably pins the destination and marker before any local byte
+// changes. It verifies the complete original plaintext for a partial edit of an
+// authoritative file. Call with item.mu held; item.mu may be released during
+// backend calls, which the mutation gate protects across all handles.
+func (item *Item) _beginMutation(ctx context.Context, preserveOriginal bool) (began bool, err error) {
+	if !item.guardActive {
+		return item._beginWrite()
+	}
+	if item.mutationUncertain || item.guardHeld != "" {
+		return false, &writeback.HeldError{Reason: item.guardHeld}
+	}
+	guard := item.c.fremote.(fs.GuardedWriteFs)
+	generation := item.info.UploadGeneration
+	var intent fs.GuardedWriteIntent
+	if item.guardJournal != nil && item.guardJournal.Generation == generation {
+		intent = item.guardJournal.Intent
+	} else {
+		item.mu.Unlock()
+		captured, captureErr := guard.CaptureWriteDestination(ctx, item.name)
+		item.mu.Lock()
+		if captureErr != nil {
+			return false, captureErr
+		}
+		intent = captured
+	}
+	if preserveOriginal && !item.info.Dirty {
+		switch intent.Baseline.Kind {
+		case fs.GuardedBaselineAbsent:
+		case fs.GuardedBaselineVersion:
+			if intent.Baseline.Hash == nil || intent.Baseline.Hash.Algorithm != "blake3" {
+				return false, fs.ErrGuardedProofUnavailable
+			}
+			size, sizeErr := item._getSize()
+			if sizeErr != nil {
+				return false, sizeErr
+			}
+			if size != intent.Baseline.Size {
+				return false, fs.ErrGuardedConflict
+			}
+			if err := item._ensure(0, size); err != nil {
+				return false, err
+			}
+			item.mu.Unlock()
+			_, verifyErr := guard.VerifyGuardedOriginal(ctx, intent, io.NewSectionReader(item.fd, 0, size), size)
+			item.mu.Lock()
+			if verifyErr != nil {
+				return false, verifyErr
+			}
+		default:
+			return false, fs.ErrGuardedProofUnavailable
+		}
+	}
+	began, err = item._beginWrite()
+	if err != nil {
+		return false, err
+	}
+	journal := &fs.GuardedWriteJournal{
+		Version: fs.GuardedWriteJournalVersion, Intent: intent, Generation: item.info.UploadGeneration,
+	}
+	if state, ok := item._admissionStateLocked(); ok {
+		journal.AdmissionKey, journal.SessionID = state.RequestKey, state.UploadID
+	}
+	item.guardJournal = journal
+	marker := item.info.UploadGeneration
+	if marker == "" {
+		marker = mutationMarkerPending
+	}
+	item.info.MutationMarker = marker
+	oldGuard := item.info.UploadGuard
+	saveErr := item._saveGuardLocked()
+	if saveErr == nil {
+		saveErr = item._save()
+	}
+	if saveErr != nil {
+		item.info.UploadGuard, item.info.MutationMarker = oldGuard, ""
+		item.guardJournal = nil
+		if began {
+			item.info.Dirty = item.writeWasDirty
+			item.admissionChanging = false
+			item.cond.Broadcast()
+		}
+		return false, fmt.Errorf("vfs cache: failed to persist local mutation marker: %w", saveErr)
+	}
+	return began, nil
+}
+
+// mutationMarkerPending marks a first mutation whose upload generation is
+// created only when the changed bytes are durably synced.
+const mutationMarkerPending = "pending"
+
+// GuardedReceiptProof returns the durable, read-only proof for one unresolved
+// guarded generation. It is only valid when the local bytes and digest survived.
+func (item *Item) GuardedReceiptProof() (fs.GuardedReceiptProof, bool) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if !item.guardActive || item.guardJournal == nil || item.mutationUncertain ||
+		item.info.MutationMarker != "" || item.guardJournal.Receipt != nil ||
+		item.guardJournal.PlainHash == nil || item.guardJournal.PlainSize < 0 {
+		return fs.GuardedReceiptProof{}, false
+	}
+	journal := *item.guardJournal
+	if journal.AdmissionKey == "" || journal.SessionID == "" {
+		// The journal is the durable attempt. The admission state is only a
+		// fallback for a save that never completed.
+		if state, ok := item._admissionStateLocked(); ok {
+			if journal.AdmissionKey == "" {
+				journal.AdmissionKey = state.RequestKey
+			}
+			if journal.SessionID == "" {
+				journal.SessionID = state.UploadID
+			}
+		}
+	}
+	if journal.AdmissionKey == "" || journal.SessionID == "" {
+		return fs.GuardedReceiptProof{}, false
+	}
+	return fs.GuardedReceiptProof{
+		Service: journal.Intent.Service, PartOrigin: journal.Intent.PartOrigin, Owner: journal.Intent.Owner,
+		MountRoot: journal.Intent.MountRoot, RecoveryIncarnation: journal.Intent.RecoveryIncarnation,
+		AdmissionKey: journal.AdmissionKey, SessionID: journal.SessionID,
+		LocalGeneration: journal.Generation, Size: journal.PlainSize, Hash: *journal.PlainHash,
+	}, true
+}
+
+// guardedLocalProof hashes the complete local plaintext and proves the frozen
+// baseline at the backend. The cache item must be unlocked by the caller.
+func (item *Item) guardedLocalProof(ctx context.Context, guard fs.GuardedWriteFs, cacheObj fs.Object, intent fs.GuardedWriteIntent, size int64) (fs.ContentHash, error) {
+	in, err := cacheObj.Open(ctx)
+	if err != nil {
+		return fs.ContentHash{}, fmt.Errorf("vfs cache: failed to open guarded source: %w", err)
+	}
+	hash, verifyErr := guard.VerifyGuardedOriginal(ctx, intent, in, size)
+	return hash, errors.Join(verifyErr, in.Close())
+}
+
+// guardedNamespaceEpoch snapshots the receipt-installation fence, or zero when
+// the backend publishes no namespace epoch.
+func guardedNamespaceEpoch(f fs.Fs) uint64 {
+	if ns, ok := f.(fs.GuardedNamespaceFs); ok {
+		return ns.GuardedNamespaceEpoch()
+	}
+	return 0
+}
+
+// _holdGuard records a definitive non-runnable reason and persists it. Call
+// with item.mu held.
+func (item *Item) _holdGuard(reason string) error {
+	item.guardHeld = reason
+	item.info.GuardHold = reason
+	if item.guardJournal != nil {
+		item.guardJournal.Reason = reason
+		_ = item._saveGuardLocked()
+	}
+	if err := item._save(); err != nil {
+		fs.Errorf(item.name, "vfs cache: failed to persist guarded hold: %v", err)
+	}
+	return &writeback.HeldError{Reason: reason}
+}
+
+// _proveGuardedBytes re-hashes the complete local plaintext against the digest
+// captured before the send. Bytes that cannot be proven never reconcile.
+//
+// Call with item.mu held.
+func (item *Item) _proveGuardedBytes(ctx context.Context, journal *fs.GuardedWriteJournal) error {
+	if journal.PlainHash == nil || journal.PlainSize < 0 {
+		return fs.ErrGuardedProofUnavailable
+	}
+	hasher, ok := item.c.fremote.(fs.GuardedPlaintextHasher)
+	if !ok {
+		return fs.ErrGuardedUnsupported
+	}
+	in, err := file.Open(item.c.toOSPath(item.name)) // No locking in Cache
+	if err != nil {
+		return err
+	}
+	hash, hashErr := hasher.HashGuardedPlaintext(ctx, in, journal.PlainSize)
+	closeErr := in.Close()
+	if hashErr != nil || closeErr != nil {
+		return errors.Join(hashErr, closeErr)
+	}
+	if hash.Algorithm != journal.PlainHash.Algorithm ||
+		!strings.EqualFold(hash.Value, journal.PlainHash.Value) {
+		return fs.ErrGuardedConflict
+	}
+	return nil
+}
+
+// errGuardNamespaceMoved reports that a namespace invalidation crossed an
+// attempt before its publication fence, so the attempt proved nothing durable.
+var errGuardNamespaceMoved = errors.New("vfs cache: guarded namespace moved during reconciliation")
+
+// reconcileGuard resolves one reloaded guarded generation without a new attempt.
+// It adopts a durable receipt, or the exact read-only result, and re-homes the
+// local alias onto the authoritative destination. It returns true only when the
+// generation became clean; every other outcome stays held and readable.
+//
+// A restart can replay the invalidation for the very move its receipt already
+// records. Nothing turns clean before an attempt's fence, so a fresh attempt
+// under the new epoch is safe; a namespace that never settles still holds.
+func (item *Item) reconcileGuard(ctx context.Context) (bool, error) {
+	const attempts = 5
+	for attempt := 0; ; attempt++ {
+		adopted, err := item.reconcileGuardAttempt(ctx)
+		if !errors.Is(err, errGuardNamespaceMoved) {
+			return adopted, err
+		}
+		if attempt+1 >= attempts {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: namespace changed during reconciliation")
+		}
+	}
+}
+
+// reconcileGuardAttempt performs one read-only receipt proof and alias
+// placement fenced by the namespace epoch it started in.
+func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
+	item.mu.Lock()
+	if !item.guardActive || !item.info.Dirty {
+		item.mu.Unlock()
+		return false, nil
+	}
+	journal := item.guardJournal
+	generation := item.info.UploadGeneration
+	uncertain := item.mutationUncertain
+	item.mu.Unlock()
+
+	if uncertain || journal == nil || journal.Generation != generation {
+		item.mu.Lock()
+		defer item.mu.Unlock()
+		if item.guardHeld != "" {
+			return false, &writeback.HeldError{Reason: item.guardHeld}
+		}
+		return false, item._holdGuard("vfs cache: uncertain guarded generation")
+	}
+
+	item.mu.Lock()
+	proofErr := item._proveGuardedBytes(ctx, journal)
+	if proofErr != nil {
+		if errors.Is(proofErr, fs.ErrGuardedConflict) || errors.Is(proofErr, fs.ErrGuardedProofUnavailable) ||
+			errors.Is(proofErr, fs.ErrGuardedUnsupported) {
+			return false, item._holdGuard("vfs cache: local guarded bytes are not proven")
+		}
+		item.mu.Unlock()
+		return false, proofErr
+	}
+	epoch := guardedNamespaceEpoch(item.c.fremote)
+	item.mu.Unlock()
+
+	resolver, ok := item.c.fremote.(fs.GuardedAliasResolver)
+	if !ok {
+		item.mu.Lock()
+		defer item.mu.Unlock()
+		return false, item._holdGuard("vfs cache: guarded alias cannot be resolved")
+	}
+	alias, err := resolver.ResolveGuardedAlias(ctx, journal.Intent)
+	if err != nil {
+		item.mu.Lock()
+		defer item.mu.Unlock()
+		return false, item._holdGuard("vfs cache: guarded destination is not current")
+	}
+
+	var receipt fs.GuardedCommit
+	var object fs.Object
+	if journal.Receipt != nil {
+		receipt = *journal.Receipt
+		if receipt.Generation != generation || receipt.Size != journal.PlainSize ||
+			journal.PlainHash == nil || receipt.Hash.Algorithm != journal.PlainHash.Algorithm ||
+			!strings.EqualFold(receipt.Hash.Value, journal.PlainHash.Value) {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: durable receipt does not match the local proof")
+		}
+		object, err = item.c.fremote.NewObject(ctx, alias)
+		if err != nil {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: guarded result is not readable")
+		}
+	} else {
+		reconciler, ok := item.c.fremote.(fs.GuardedReceiptFs)
+		if !ok {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: guarded receipt cannot be reconciled")
+		}
+		proof, ok := item.GuardedReceiptProof()
+		if !ok {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			if item.guardHeld != "" {
+				return false, &writeback.HeldError{Reason: item.guardHeld}
+			}
+			return false, item._holdGuard("vfs cache: guarded attempt is not proven")
+		}
+		proof.NamespaceEpoch = epoch
+		result, reconcileErr := reconciler.ReconcileGuardedReceipt(ctx, proof)
+		if reconcileErr != nil {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: guarded result could not be reconciled")
+		}
+		if result.ResultID == "" || result.Size != journal.PlainSize ||
+			result.Hash.Algorithm != journal.PlainHash.Algorithm ||
+			!strings.EqualFold(result.Hash.Value, journal.PlainHash.Value) ||
+			(result.NamespaceEpoch != 0 && result.NamespaceEpoch != epoch) {
+			item.mu.Lock()
+			defer item.mu.Unlock()
+			return false, item._holdGuard("vfs cache: reconciled result does not match the local proof")
+		}
+		object = result.Object
+		receipt = fs.GuardedCommit{
+			AdmissionKey: journal.AdmissionKey, SessionID: journal.SessionID, Generation: generation,
+			ResultID: result.ResultID, ResultGeneration: result.Generation,
+			ParentSegments: append([]string(nil), result.ParentSegments...), LocationKnown: result.LocationKnown,
+			NamespaceEpoch: epoch, Size: result.Size, Hash: result.Hash,
+		}
+	}
+
+	// Persist the exact receipt before the alias is reserved and before the
+	// generation may turn clean.
+	item.mu.Lock()
+	if item.info.UploadGeneration != generation {
+		item.mu.Unlock()
+		return false, &writeback.HeldError{Reason: "vfs cache: guarded generation changed during reconciliation"}
+	}
+	journal.Receipt = &receipt
+	journal.Reason = ""
+	if saveErr := item._saveGuardLocked(); saveErr != nil {
+		item.mu.Unlock()
+		return false, &writeback.HeldError{Reason: "vfs cache: reconciled receipt save failed"}
+	}
+	if saveErr := item._save(); saveErr != nil {
+		item.mu.Unlock()
+		return false, &writeback.HeldError{Reason: "vfs cache: reconciled receipt save failed"}
+	}
+	item.mu.Unlock()
+
+	if err := item.c.AdoptAlias(item, alias); err != nil {
+		item.mu.Lock()
+		defer item.mu.Unlock()
+		return false, item._holdGuard("vfs cache: guarded alias is occupied")
+	}
+
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if guardedNamespaceEpoch(item.c.fremote) != epoch {
+		return false, errGuardNamespaceMoved
+	}
+	item.o = object
+	// No fingerprint yet: the adopted local bytes stay authoritative until a
+	// real listing binds this item to its object. A nil-object open must not
+	// treat the proven result as a deleted remote.
+	item.guardHeld = ""
+	item.info.GuardHold = ""
+	item.info.MutationMarker = ""
+	item.info.Dirty = false
+	if err := item._save(); err != nil {
+		item.info.Dirty = true
+		return false, item._holdGuard("vfs cache: reconciled clean metadata save failed")
+	}
+	return true, nil
+}
+
+// _syncGuardAttemptLocked copies the B2 admission identity into the durable
+// journal so a restart can prove this exact attempt read-only. Call with
+// item.mu held.
+func (item *Item) _syncGuardAttemptLocked() {
+	if !item.guardActive || item.guardJournal == nil {
+		return
+	}
+	state, ok := item._admissionStateLocked()
+	if !ok {
+		return
+	}
+	if item.guardJournal.AdmissionKey == state.RequestKey && item.guardJournal.SessionID == state.UploadID {
+		return
+	}
+	item.guardJournal.AdmissionKey, item.guardJournal.SessionID = state.RequestKey, state.UploadID
+	if err := item._saveGuardLocked(); err != nil {
+		fs.Errorf(item.name, "vfs cache: failed to persist guarded attempt: %v", err)
+		return
+	}
+	if err := item._save(); err != nil {
+		fs.Errorf(item.name, "vfs cache: failed to persist guarded attempt: %v", err)
+	}
+}
+
+// guardedHoldReason maps a typed guard refusal to one stable durable reason.
+func guardedHoldReason(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrGuardedProofUnavailable):
+		return "vfs cache: original content proof is unavailable"
+	case errors.Is(err, fs.ErrGuardedHold):
+		return "vfs cache: guarded write is held"
+	default:
+		return "vfs cache: guarded destination conflict"
+	}
+}
+
+// _recordGuardedReceipt persists the exact completed result and path before any
+// clean transition. Call with item.mu held.
+func (item *Item) _recordGuardedReceipt(o fs.Object, generation string) error {
+	published, ok := o.(fs.GuardedPublishedObject)
+	if !ok {
+		return item._heldErrorLocked("vfs cache: guarded completion has no exact result")
+	}
+	result, ok := published.GuardedWriteResult()
+	if !ok || result.ResultID == "" {
+		return item._heldErrorLocked("vfs cache: guarded completion has no exact result")
+	}
+	journal := item.guardJournal
+	if journal == nil || journal.Generation != generation || journal.PlainHash == nil {
+		return item._heldErrorLocked("vfs cache: guarded journal does not match the completed generation")
+	}
+	if result.Size != journal.PlainSize || result.Hash.Algorithm != journal.PlainHash.Algorithm ||
+		!strings.EqualFold(result.Hash.Value, journal.PlainHash.Value) {
+		return item._heldErrorLocked("vfs cache: guarded result does not match the local proof")
+	}
+	journal.Receipt = &fs.GuardedCommit{
+		AdmissionKey: journal.AdmissionKey, SessionID: journal.SessionID, Generation: generation,
+		ResultID: result.ResultID, ResultGeneration: result.Generation,
+		ParentSegments: append([]string(nil), result.ParentSegments...), LocationKnown: result.LocationKnown,
+		NamespaceEpoch: result.NamespaceEpoch, Size: result.Size, Hash: result.Hash,
+	}
+	journal.Reason = ""
+	return item._saveGuardLocked()
 }
 
 // truncate the item to the given size, creating it if necessary
@@ -327,11 +988,16 @@ func (item *Item) _truncateToCurrentSize() (err error) {
 func (item *Item) Truncate(size int64) (err error) {
 	item.preAccess()
 	defer item.postAccess()
+	item.mutation.Lock()
+	defer item.mutation.Unlock()
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
 	if item.fd == nil {
 		return errors.New("vfs cache item truncate: internal error: didn't Open file")
+	}
+	if size < 0 {
+		return nil
 	}
 
 	// Read old size
@@ -343,9 +1009,20 @@ func (item *Item) Truncate(size int64) (err error) {
 		oldSize = 0
 	}
 
+	begin := false
+	if size != oldSize || item.o == nil {
+		// A nonzero truncate preserves part of the original content, so the
+		// complete original plaintext must be verified before it changes.
+		begin, err = item._beginMutation(item.c.ctx, size != 0)
+		if err != nil {
+			return err
+		}
+	} else {
+		return nil
+	}
 	err = item._truncate(size)
 	if err != nil {
-		return err
+		return errors.Join(err, item._finishWrite(begin, false))
 	}
 
 	changed := true
@@ -353,18 +1030,14 @@ func (item *Item) Truncate(size int64) (err error) {
 		// Truncate extends the file in which case all new bytes are
 		// read as zeros. In this case we must show we have written to
 		// the new parts of the file.
-		item._written(oldSize, size)
+		item._written(oldSize, size-oldSize)
 	} else if size < oldSize {
 		// Truncate shrinks the file so clip the downloaded ranges
 		item.info.Rs = item.info.Rs.Intersection(ranges.Range{Pos: 0, Size: size})
 	} else {
 		changed = item.o == nil
 	}
-	if changed {
-		item._dirty()
-	}
-
-	return nil
+	return item._finishWrite(begin, changed)
 }
 
 // _stat gets the current stat of the backing file
@@ -427,22 +1100,117 @@ func (item *Item) Exists() bool {
 	return item._exists()
 }
 
+// _beginWrite cancels the old writer before content can change.
+// Call with item.mu held; the transition keeps later stores fail-closed.
+func (item *Item) _beginWrite() (bool, error) {
+	for item.admissionChanging {
+		item.cond.Wait()
+	}
+	if item.modified && item.storeCancel == nil && !item.admissionFrozen {
+		if item.admissionUnsaved {
+			return false, item._save()
+		}
+		return false, nil
+	}
+	item.admissionChanging = true
+	done := item.storeDone
+	if item.storeCancel != nil {
+		item.storeCancel()
+	}
+	item.mu.Unlock()
+	item.c.writeback.Remove(item.writeBackID)
+	if done != nil {
+		<-done
+	}
+	item.mu.Lock()
+	item.writeWasDirty = item.info.Dirty
+	item.info.Dirty = true
+	// Retain the old admission until bytes actually change. A crash here must
+	// not replay an old clean flag over newly written source bytes.
+	if !item.writeWasDirty || item.admissionUnsaved {
+		if err := item._save(); err != nil {
+			item.info.Dirty = item.writeWasDirty
+			item.admissionChanging = false
+			item.cond.Broadcast()
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (item *Item) _finishWrite(begin, changed bool) (err error) {
+	marker := item.info.MutationMarker
+	if changed {
+		if begin {
+			item._newUploadGeneration()
+		}
+		item.modified, item.info.Dirty = true, true
+		item.info.ModTime = time.Now()
+		item.info.ATime = item.info.ModTime
+		if marker != "" && (marker == item.info.UploadGeneration || marker == mutationMarkerPending || begin) {
+			item.info.MutationMarker = ""
+			if item.guardJournal != nil {
+				item.guardJournal.Generation = item.info.UploadGeneration
+				_ = item._saveGuardLocked()
+			}
+		}
+		err = item._save()
+		if err != nil && marker != "" {
+			// The bytes changed but the ranges and generation were not
+			// durably synced, so no range on disk is proof any more.
+			item.info.MutationMarker = marker
+			item.mutationUncertain = true
+			item.guardHeld = "vfs cache: local mutation metadata save failed"
+			item.info.GuardHold = item.guardHeld
+			if item.guardJournal != nil {
+				item.guardJournal.Reason = item.guardHeld
+				_ = item._saveGuardLocked()
+			}
+		}
+	} else {
+		if marker != "" {
+			// No byte changed, so the marker can be cleared alone.
+			item.info.MutationMarker = ""
+			_ = item._saveGuardLocked()
+			if saveErr := item._save(); saveErr != nil {
+				item.info.MutationMarker = marker
+				item.mutationUncertain = true
+				item.guardHeld = "vfs cache: local mutation marker clear failed"
+				item.info.GuardHold = item.guardHeld
+			} else {
+				err = saveErr
+			}
+		} else if begin && !item.writeWasDirty {
+			item.info.Dirty = false
+			err = item._save()
+		}
+	}
+	if begin {
+		item.admissionChanging = false
+		item.cond.Broadcast()
+	}
+	return err
+}
+
 // _dirty marks the item as changed and needing writeback
 //
 // call with lock held
 func (item *Item) _dirty() {
 	item.info.ModTime = time.Now()
 	item.info.ATime = item.info.ModTime
-	if !item.modified {
-		item.modified = true
-		item.mu.Unlock()
-		item.c.writeback.Remove(item.writeBackID)
-		item.mu.Lock()
+	save := !item.info.Dirty
+	begin, err := item._beginWrite()
+	if err != nil {
+		fs.Errorf(item.name, "vfs cache: failed to persist dirty marker: %v", err)
+	} else if begin {
+		if err := item._finishWrite(begin, true); err != nil {
+			fs.Errorf(item.name, "vfs cache: failed to save upload generation: %v", err)
+		}
+		save = false // the generation save was already attempted
 	}
-	if !item.info.Dirty {
-		item.info.Dirty = true
-		err := item._save()
-		if err != nil {
+	item.info.Dirty = true
+	if save {
+		if err := item._save(); err != nil {
 			fs.Errorf(item.name, "vfs cache: failed to save item info: %v", err)
 		}
 	}
@@ -590,7 +1358,9 @@ func (item *Item) open(o fs.Object) (err error) {
 
 	err = item._createFile(osPath)
 	if err != nil {
-		item._remove("item.open failed on _createFile, remove cache data/metadata files")
+		if !item.info.Dirty && len(item.info.UploadAdmission) == 0 {
+			item._remove("item.open failed on _createFile, remove clean cache data/metadata files")
+		}
 		item.fd = nil
 		item.opens--
 		return fmt.Errorf("vfs cache item: create cache file failed: %w", err)
@@ -642,29 +1412,155 @@ func unlockMutexForCall(mu *sync.Mutex, f func()) {
 func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	// defer log.Trace(item.name, "item=%p", item)("err=%v", &err)
 
+	generation := item.info.UploadGeneration
+	var epoch uint64
+	current := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if item.admissionChanging || item.info.UploadGeneration != generation {
+			return errors.New("vfs cache: upload generation changed during writeback")
+		}
+		return nil
+	}
+	if err := current(); err != nil {
+		return err
+	}
+	if item.storeCancel != nil {
+		return errors.New("vfs cache: writeback already active")
+	}
+	if item.guardActive {
+		if item.mutationUncertain || item.guardHeld != "" {
+			return item._heldErrorLocked(item.guardHeld)
+		}
+		if item.guardJournal == nil || item.guardJournal.Generation != generation {
+			return item._heldErrorLocked("vfs cache: guarded journal is unavailable")
+		}
+		if item.info.MutationMarker != "" {
+			return item._heldErrorLocked("vfs cache: local mutation is unresolved")
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	item.storeCancel, item.storeDone = cancel, done
+	defer func() {
+		cancel()
+		item.storeCancel, item.storeDone = nil, nil
+		close(done)
+	}()
+	ctx = fs.WithUploadAdmissionStore(ctx, &itemAdmissionStore{item: item, generation: generation})
 	// Transfer the temp file to the remote
 	cacheObj, err := item.c.fcache.NewObject(ctx, item.name)
-	if err != nil && err != fs.ErrorObjectNotFound {
+	if err != nil {
 		return fmt.Errorf("vfs cache: failed to find cache file: %w", err)
 	}
 
-	// Object has disappeared if cacheObj == nil
-	if cacheObj != nil {
-		o, name := item.o, item.name
-		unlockMutexForCall(&item.mu, func() {
-			o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
-		})
-		if err != nil {
-			if errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
-				fs.Errorf(name, "Writeback failed: %v", err)
-				return nil
+	if cacheObj == nil {
+		return errors.New("vfs cache: dirty source is unavailable")
+	}
+	if item.guardActive {
+		// Prove the exact local plaintext and persist it before any send.
+		journal := *item.guardJournal
+		size := item.info.Size
+		guard := item.c.fremote.(fs.GuardedWriteFs)
+		// The installation fence is captured before the completing request.
+		epoch = guardedNamespaceEpoch(item.c.fremote)
+		item.mu.Unlock()
+		hash, proofErr := item.guardedLocalProof(ctx, guard, cacheObj, journal.Intent, size)
+		item.mu.Lock()
+		if proofErr != nil {
+			if errors.Is(proofErr, fs.ErrGuardedConflict) || errors.Is(proofErr, fs.ErrGuardedHold) ||
+				errors.Is(proofErr, fs.ErrGuardedProofUnavailable) {
+				return item._heldErrorLocked(guardedHoldReason(proofErr))
 			}
-			return fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
+			return proofErr
 		}
-		item.o = o
-		item._updateFingerprint()
+		if err := current(); err != nil {
+			return err
+		}
+		if state, ok := item._admissionStateLocked(); ok {
+			if state.RequestKey != "" {
+				journal.AdmissionKey = state.RequestKey
+			}
+			if state.UploadID != "" {
+				journal.SessionID = state.UploadID
+			}
+		}
+		journal.PlainSize = size
+		journal.PlainHash = &hash
+		item.guardJournal = &journal
+		_ = item._saveGuardLocked()
+		if saveErr := item._save(); saveErr != nil {
+			return item._heldErrorLocked("vfs cache: guarded proof save failed")
+		}
+		ctx = fs.WithGuardedWriteIntent(ctx, journal.Intent)
+	}
+	o, name := item.o, item.name
+	unlockMutexForCall(&item.mu, func() {
+		o, err = operations.Copy(ctx, item.c.fremote, o, name, cacheObj)
+	})
+	if err := current(); err != nil {
+		return err
+	}
+	if err != nil {
+		if errors.Is(err, fs.ErrorCantUploadEmptyFiles) {
+			fs.Errorf(name, "Writeback failed: %v", err)
+			return nil
+		}
+		// The attempt identity must be durable before any outcome can hold it.
+		item._syncGuardAttemptLocked()
+		if item.guardActive && (errors.Is(err, fs.ErrGuardedConflict) || errors.Is(err, fs.ErrGuardedHold) ||
+			errors.Is(err, fs.ErrGuardedProofUnavailable)) {
+			return item._heldErrorLocked(guardedHoldReason(err))
+		}
+		return fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
+	}
+	item.o = o
+	item._updateFingerprint()
+	if item.guardActive {
+		if err := item._recordGuardedReceipt(o, generation); err != nil {
+			return err
+		}
+		// A receipt may only become a clean alias in the namespace it was
+		// completing in, and only at the authoritative destination.
+		if guardedNamespaceEpoch(item.c.fremote) != epoch {
+			return item._heldErrorLocked("vfs cache: namespace changed before receipt installation")
+		}
+		intent := item.guardJournal.Intent
+		resolver, ok := item.c.fremote.(fs.GuardedAliasResolver)
+		if !ok {
+			return item._heldErrorLocked("vfs cache: guarded alias cannot be resolved")
+		}
+		item.mu.Unlock()
+		alias, aliasErr := resolver.ResolveGuardedAlias(ctx, intent)
+		if aliasErr != nil {
+			alias = ""
+		} else {
+			aliasErr = item.c.AdoptAlias(item, alias)
+		}
+		item.mu.Lock()
+		if aliasErr != nil {
+			return item._heldErrorLocked("vfs cache: guarded result could not be placed")
+		}
+		if guardedNamespaceEpoch(item.c.fremote) != epoch {
+			return item._heldErrorLocked("vfs cache: namespace changed before receipt installation")
+		}
 	}
 
+	// Persist success before StoreFn, but keep the item ineligible for removal
+	// until the VFS callback returns.
+	item.info.Dirty = false
+	err = item._save()
+	item.info.Dirty = true
+	if err != nil {
+		if item.guardActive {
+			return item._heldErrorLocked("vfs cache: completed receipt save failed")
+		}
+		return fmt.Errorf("vfs cache: failed to write clean metadata: %w", err)
+	}
+	if err := current(); err != nil {
+		return err
+	}
 	// Write the object back to the VFS layer before we mark it as
 	// clean, otherwise it will become eligible for removal which
 	// can cause a deadlock
@@ -676,13 +1572,13 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		storeFn(o)
 		item.mu.Lock()
 	}
+	if err := current(); err != nil {
+		return err
+	}
 
 	// Show item is clean and is eligible for cache removal
 	item.info.Dirty = false
-	err = item._save()
-	if err != nil {
-		fs.Errorf(item.name, "vfs cache: failed to write metadata file: %v", err)
-	}
+	// Clean metadata was committed before exposing the result.
 
 	return nil
 }
@@ -773,7 +1669,7 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 	// FIXME It would be nice to do this asynchronously however it
 	// would require keeping the downloaders alive after the item
 	// has been closed
-	if item.info.Dirty && item.o != nil {
+	if item.info.Dirty && item.o != nil && !item.mutationUncertain && item.guardHeld == "" {
 		err = item._ensure(0, item.info.Size)
 		if err != nil {
 			return fmt.Errorf("vfs cache: failed to download missing parts of cache file: %w", err)
@@ -860,14 +1756,52 @@ func (item *Item) _actualClose(storeFn StoreFn, syncWriteBack bool) (err error) 
 func (item *Item) reload(ctx context.Context) error {
 	item.mu.Lock()
 	dirty := item.info.Dirty
+	guarded := dirty && item.guardActive
 	item.mu.Unlock()
 	if !dirty {
 		return nil
 	}
-	// see if the object still exists
-	obj, lookupErr := item.c.fremote.NewObject(ctx, item.name)
+	if guarded {
+		// Restart reconciliation owns eligibility for a guarded generation.
+		// Nothing may be queued or sent before the journal is resolved.
+		return nil
+	}
+	store := item.admissionStore()
+	ctx = fs.WithUploadAdmissionStore(ctx, store)
+	cacheObj, err := item.c.fcache.NewObject(ctx, item.name)
+	if err != nil {
+		return fmt.Errorf("reload: dirty source is unavailable: %w", err)
+	}
+	if cacheObj == nil {
+		return errors.New("reload: dirty source is unavailable")
+	}
+	ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{
+		Source: cacheObj, Destination: item.c.fremote, DestinationRemote: item.name,
+	})
+	fullRecovery := false
+	if _, aware := item.c.fremote.(fs.UploadAdmissionChecker); aware {
+		state, err := store.LoadUploadAdmission(ctx)
+		if err != nil {
+			return fmt.Errorf("reload: upload journal is unavailable: %w", err)
+		}
+		item.mu.Lock()
+		fullRecovery = state.RequestKey != "" && len(state.Request) != 0 && state.IntentFingerprint != "" &&
+			cacheObj.Size() == item.info.Size && item._present()
+		item.mu.Unlock()
+	}
+	var obj fs.Object
+	var lookupErr error
+	if !fullRecovery {
+		sourceRemote := cacheObj.Remote()
+		lookupCtx := fs.WithUploadAdmissionDiscovery(ctx, cacheObj.Fs(), &sourceRemote)
+		obj, lookupErr = item.c.fremote.NewObject(lookupCtx, item.name)
+		if lookupErr != nil && (fs.IsUploadAdmissionError(lookupErr) || !errors.Is(lookupErr, fs.ErrorObjectNotFound)) {
+			return fmt.Errorf("reload: destination proof is unavailable: %w", lookupErr)
+		}
+	}
+	// Full local recovery queues a transfer; only its session/body proof may acknowledge success.
 	// open the file with the object (or nil)
-	err := item.Open(obj)
+	err = item.Open(obj)
 	if err != nil {
 		return err
 	}
@@ -942,6 +1876,12 @@ func (item *Item) _checkObject(o fs.Object) error {
 			// remote object && no local object
 			// Set fingerprint
 			item.info.Fingerprint = remoteFingerprint
+		}
+		if item.guardActive && item.info.Dirty {
+			// A dirty guarded generation owns its backing bytes and identity.
+			// A resync or a shorter external replacement never truncates or
+			// rebinds it.
+			return nil
 		}
 		item.info.Size = o.Size()
 	}
@@ -1277,6 +2217,11 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 	}
 	r := ranges.Range{Pos: offset, Size: size}
 	present := item.info.Rs.Present(r)
+	if !present && item.guardActive && (item.guardHeld != "" || item.mutationUncertain) {
+		// A held item must never fill a missing range from an external
+		// replacement, and an interrupted mutation left no proven range.
+		return &writeback.HeldError{Reason: "unproven range on a held item"}
+	}
 	/* This statement simulates a cache space error for test purpose */
 	/* if present != true && item.info.Rs.Size() > 32*1024*1024 {
 		return errors.New("no space left on device")
@@ -1444,10 +2389,20 @@ func (item *Item) readAt(b []byte, off int64) (n int, err error) {
 func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 	item.preAccess()
 	defer item.postAccess()
+	item.mutation.Lock()
+	defer item.mutation.Unlock()
 	item.mu.Lock()
 	if item.fd == nil {
 		item.mu.Unlock()
 		return 0, errors.New("vfs cache item WriteAt: internal error: didn't Open file")
+	}
+	begin := false
+	if len(b) != 0 {
+		begin, err = item._beginMutation(item.c.ctx, true)
+		if err != nil {
+			item.mu.Unlock()
+			return 0, err
+		}
 	}
 	item.mu.Unlock()
 	// Do the writing with Item.mu unlocked
@@ -1456,21 +2411,22 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 		err = fmt.Errorf("short write: tried to write %d but only %d written", len(b), n)
 	}
 	item.mu.Lock()
-	item._written(off, int64(n))
 	if n > 0 {
-		item._dirty()
+		item._written(off, int64(n))
+		end := off + int64(n)
+		// Writing off the end of the file so need to make some
+		// zeroes.  we do this by showing that we have written to the
+		// new parts of the file.
+		if off > item.info.Size {
+			item._written(item.info.Size, off-item.info.Size)
+		}
+		// Update size
+		if end > item.info.Size {
+			item.info.Size = end
+		}
 	}
-	end := off + int64(n)
-	// Writing off the end of the file so need to make some
-	// zeroes.  we do this by showing that we have written to the
-	// new parts of the file.
-	if off > item.info.Size {
-		item._written(item.info.Size, off-item.info.Size)
-		item._dirty()
-	}
-	// Update size
-	if end > item.info.Size {
-		item.info.Size = end
+	if begin || n > 0 || item.info.MutationMarker != "" {
+		err = errors.Join(err, item._finishWrite(begin, n > 0))
 	}
 	item.mu.Unlock()
 	return n, err
@@ -1576,34 +2532,63 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	item.preAccess()
 	defer item.postAccess()
 	item.mu.Lock()
-
-	// stop downloader
+	for item.admissionChanging {
+		item.cond.Wait()
+	}
+	if name == newName {
+		item.o = newObj
+		item._updateFingerprint()
+		item.mu.Unlock()
+		return nil
+	}
+	item.admissionChanging = true
 	downloaders := item.downloaders
 	item.downloaders = nil
-
-	// id for writeback cancel
-	id := item.writeBackID
-
-	// Set internal state
-	item.name = newName
-	item.o = newObj
-	item._updateFingerprint()
-
-	// Rename cache file if it exists
-	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
-
-	// Rename meta file if it exists
-	err2 := rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
-	if err2 != nil {
-		err = err2
+	id, done := item.writeBackID, item.storeDone
+	if item.storeCancel != nil {
+		item.storeCancel()
 	}
-
 	item.mu.Unlock()
-
-	// close downloader and cancel writebacks with mutex unlocked
 	if downloaders != nil {
 		_ = downloaders.Close(nil)
 	}
 	item.c.writeback.Rename(id, newName)
+	if done != nil {
+		<-done
+	}
+	item.mu.Lock()
+	oldInfo, oldObject := item.info, item.o
+	oldAdmissionErr, oldFrozen := item.admissionErr, item.admissionFrozen
+	dataMoved, metaMoved := false, false
+	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName))
+	if err == nil {
+		dataMoved = true
+		err = rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName))
+		metaMoved = err == nil
+	}
+	if err == nil {
+		item.name, item.o = newName, newObj
+		if item.info.Dirty {
+			item._newUploadGeneration()
+		}
+		item._updateFingerprint()
+		err = item._save()
+	}
+	if err != nil {
+		item.name, item.o, item.info = name, oldObject, oldInfo
+		item.admissionErr, item.admissionFrozen = oldAdmissionErr, oldFrozen
+		if metaMoved {
+			err = errors.Join(err, rename(item.c.toOSPathMeta(newName), item.c.toOSPathMeta(name)))
+		}
+		if dataMoved {
+			err = errors.Join(err, rename(item.c.toOSPath(newName), item.c.toOSPath(name)))
+		}
+	}
+	item.admissionChanging = false
+	item.cond.Broadcast()
+	item.mu.Unlock()
+	if err != nil {
+		item.c.writeback.Rename(id, name)
+	}
 	return err
 }

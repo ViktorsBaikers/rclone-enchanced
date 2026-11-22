@@ -41,17 +41,19 @@ import (
 // Cache opened files
 type Cache struct {
 	// read only - no locking needed to read these
-	ctx        context.Context      // context for cache lifetime
-	fremote    fs.Fs                // fs for the remote we are caching
-	fcache     fs.Fs                // fs for the cache directory
-	fcacheMeta fs.Fs                // fs for the cache metadata directory
-	opt        *vfscommon.Options   // vfs Options
-	root       string               // root of the cache directory
-	metaRoot   string               // root of the cache metadata directory
-	hashType   hash.Type            // hash to use locally and remotely
-	hashOption *fs.HashesOption     // corresponding OpenOption
-	writeback  *writeback.WriteBack // holds Items for writeback
-	avFn       AddVirtualFn         // if set, can be called to add dir entries
+	ctx        context.Context                       // context for cache lifetime
+	fremote    fs.Fs                                 // fs for the remote we are caching
+	fcache     fs.Fs                                 // fs for the cache directory
+	fcacheMeta fs.Fs                                 // fs for the cache metadata directory
+	opt        *vfscommon.Options                    // vfs Options
+	root       string                                // root of the cache directory
+	metaRoot   string                                // root of the cache metadata directory
+	dedicated  string                                // parent holding vfs/ and vfsMeta/ for this cache
+	hashType   hash.Type                             // hash to use locally and remotely
+	hashOption *fs.HashesOption                      // corresponding OpenOption
+	writeback  *writeback.WriteBack                  // holds Items for writeback
+	avFn       AddVirtualFn                          // if set, can be called to add dir entries
+	localFn    func(remote string, size int64) error // if set, adds a local-only overlay entry
 
 	mu            sync.Mutex       // protects the following variables
 	cond          sync.Cond        // cond lock for synchronous cache cleaning
@@ -124,6 +126,7 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		opt:        opt,
 		root:       dataOSPath,
 		metaRoot:   metaOSPath,
+		dedicated:  parentOSPath,
 		item:       make(map[string]*Item),
 		errItems:   make(map[string]error),
 		hashType:   hashType,
@@ -330,6 +333,20 @@ func (c *Cache) InUse(name string) bool {
 	return item.inUse()
 }
 
+// RootOSPath returns the on-disk root of this cache's data directory.
+//
+// Offline quarantine takes the exclusive form of the shared lock a running
+// client holds while it serves writes.
+func (c *Cache) RootOSPath() string {
+	return c.root
+}
+
+// DedicatedRootOSPath returns the parent directory that holds this cache's
+// data and metadata trees. Offline quarantine operates on that root.
+func (c *Cache) DedicatedRootOSPath() string {
+	return c.dedicated
+}
+
 // DirtyItem returns the Item if it exists in the cache **and** is
 // dirty otherwise it returns nil.
 //
@@ -343,6 +360,140 @@ func (c *Cache) DirtyItem(name string) (item *Item) {
 		item = nil
 	}
 	return item
+}
+
+// HeldItem returns the sticky held reason for name, or "" if it is runnable.
+//
+// name should be a remote path not an osPath
+func (c *Cache) HeldItem(name string) string {
+	name = clean(name)
+	c.mu.Lock()
+	item := c.item[name]
+	c.mu.Unlock()
+	if item == nil {
+		return ""
+	}
+	return item.HeldReason()
+}
+
+// HeldInTree reports whether any held generation lives at or below dir.
+func (c *Cache) HeldInTree(dir string) bool {
+	dir = clean(dir)
+	prefix := dir + "/"
+	c.mu.Lock()
+	items := make([]*Item, 0, len(c.item))
+	for name, item := range c.item {
+		if name == dir || strings.HasPrefix(name, prefix) {
+			items = append(items, item)
+		}
+	}
+	c.mu.Unlock()
+	for _, item := range items {
+		if item.HeldReason() != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// AddLocal registers a local-only directory entry through the VFS callback.
+// It never resolves or creates anything on the remote.
+func (c *Cache) AddLocal(remote string, size int64) error {
+	if c.localFn == nil {
+		return errors.New("no local overlay function registered")
+	}
+	return c.localFn(remote, size)
+}
+
+// SetLocalAdd registers the local-only overlay callback. It must be called
+// before ReconcileGuarded so restart-held generations stay readable.
+func (c *Cache) SetLocalAdd(fn func(remote string, size int64) error) {
+	c.localFn = fn
+}
+
+// ReconcileGuarded resolves every reloaded guarded generation before any of
+// them becomes runnable. Exact results turn clean under their authoritative
+// alias; everything else stays held and readable through a local overlay.
+func (c *Cache) ReconcileGuarded(ctx context.Context) {
+	c.mu.Lock()
+	items := make([]*Item, 0, len(c.item))
+	seen := make(map[*Item]struct{}, len(c.item))
+	for _, item := range c.item {
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		items = append(items, item)
+	}
+	c.mu.Unlock()
+	for _, item := range items {
+		adopted, err := item.reconcileGuard(ctx)
+		if err != nil {
+			fs.Infof(item.name, "vfs cache: guarded generation stays held: %v", err)
+		}
+		item.mu.Lock()
+		name, size, held := item.name, item.info.Size, item.guardHeld
+		item.mu.Unlock()
+		if adopted {
+			// The clean item is discoverable through a normal listing, which
+			// carries the authoritative object. A virtual entry without one
+			// would let a nil-object open discard the clean cache file.
+			continue
+		}
+		if held != "" {
+			if err := c.AddLocal(name, size); err != nil {
+				fs.Errorf(name, "vfs cache: failed to publish local overlay: %v", err)
+			}
+		}
+	}
+}
+
+// AdoptAlias re-homes a guarded item onto its authoritative path. The backing
+// bytes keep their identity: no second copy is created and the upload
+// generation is unchanged. It refuses when another entry owns the target.
+func (c *Cache) AdoptAlias(item *Item, newName string) error {
+	newName = clean(newName)
+	if newName == "" {
+		return errors.New("vfs cache: empty guarded alias")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if other := c.item[newName]; other != nil && other != item {
+		return fmt.Errorf("vfs cache: guarded alias %q is occupied", newName)
+	}
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	if item.name == newName {
+		return nil
+	}
+	if item.opens != 0 || item.fd != nil || item.downloaders != nil {
+		return errors.New("vfs cache: guarded alias cannot move an open item")
+	}
+	oldName := item.name
+	if _, err := os.Stat(c.toOSPath(newName)); err == nil {
+		return fmt.Errorf("vfs cache: guarded alias %q already has cache bytes", newName)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := rename(c.toOSPath(oldName), c.toOSPath(newName)); err != nil {
+		return err
+	}
+	if err := rename(c.toOSPathMeta(oldName), c.toOSPathMeta(newName)); err != nil {
+		return errors.Join(err, rename(c.toOSPath(newName), c.toOSPath(oldName)))
+	}
+	item.name = newName
+	delete(c.item, oldName)
+	c.item[newName] = item
+	if err := item._save(); err != nil {
+		item.name = oldName
+		delete(c.item, newName)
+		c.item[oldName] = item
+		return errors.Join(err,
+			rename(c.toOSPathMeta(newName), c.toOSPathMeta(oldName)),
+			rename(c.toOSPath(newName), c.toOSPath(oldName)))
+	}
+	fs.Infof(newName, "vfs cache: adopted authoritative guarded alias from %q", oldName)
+	return nil
 }
 
 // get gets a file name from the cache or creates a new one

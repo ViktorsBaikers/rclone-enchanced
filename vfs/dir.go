@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -35,15 +36,63 @@ type Dir struct {
 	parent  *Dir         // parent, nil for root
 	path    string
 	entry   fs.Directory
-	read    time.Time         // time directory entry last read
-	items   map[string]Node   // directory entries - can be empty but not nil
-	virtual map[string]vState // virtual directory entries - may be nil
+	read    time.Time           // time directory entry last read
+	items   map[string]Node     // directory entries - can be empty but not nil
+	virtual map[string]vState   // virtual directory entries - may be nil
+	local   map[string]struct{} // local-only entries which shadow the remote
+	listing *dirRead
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
 
 	_virtuals atomic.Int32 // number of virtual directory entries in this directory and children
 }
+
+// dirNamespace tracks freshness without retaining directories or taking their locks.
+// A Dir may take mu while holding Dir.mu, never the reverse.
+type dirNamespace struct {
+	mu     sync.Mutex
+	epoch  uint64
+	listed map[string]uint64 // path -> inode of the published listing
+}
+
+func (n *dirNamespace) invalidate(scope fs.ChangeScope) error {
+	if !scope.All && len(scope.Parents) == 0 && len(scope.Subtrees) == 0 {
+		return nil
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.epoch++
+	if scope.All {
+		clear(n.listed)
+		return nil
+	}
+	for _, parent := range scope.Parents {
+		delete(n.listed, parent)
+	}
+	for _, subtree := range scope.Subtrees {
+		if subtree == "" {
+			clear(n.listed)
+			break
+		}
+		for remote := range n.listed {
+			rest, matches := strings.CutPrefix(remote, subtree)
+			if matches && (rest == "" || rest[0] == '/') {
+				delete(n.listed, remote)
+			}
+		}
+	}
+	return nil
+}
+
+type dirRead struct {
+	path  string
+	epoch uint64
+	done  chan struct{}
+	err   error
+}
+
+var errDirReadInvalidated = errors.New("directory changed during read")
 
 //go:generate stringer -type=vState
 
@@ -238,6 +287,7 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	// directory or any children
 	hasVirtual = d.hasVirtual()
 	if !hasVirtual {
+		d._forgetListing()
 		d.read = time.Time{}
 		d.items = make(map[string]Node)
 		d.cleanupTimer.Stop()
@@ -357,6 +407,64 @@ func (d *Dir) _age(when time.Time) (age time.Duration, stale bool) {
 	return
 }
 
+// _forgetListing removes this Dir's publication, without affecting a newer inode at the same path.
+func (d *Dir) _forgetListing() {
+	if n := d.vfs.namespace; n != nil {
+		n.mu.Lock()
+		if n.listed[d.path] == d.inode {
+			delete(n.listed, d.path)
+		}
+		n.mu.Unlock()
+	}
+}
+
+// _readState captures freshness and the origin epoch together, with Dir.mu held.
+func (d *Dir) _readState(when time.Time) (age time.Duration, stale bool, epoch uint64) {
+	age, stale = d._age(when)
+	if n := d.vfs.namespace; n != nil {
+		n.mu.Lock()
+		epoch = n.epoch
+		stale = stale || n.listed[d.path] != d.inode
+		n.mu.Unlock()
+	}
+	return
+}
+
+// _beginReadPublication keeps a partially merged listing stale if an event wins the race.
+func (d *Dir) _beginReadPublication(epoch uint64) error {
+	if n := d.vfs.namespace; n != nil {
+		n.mu.Lock()
+		if epoch != n.epoch {
+			n.mu.Unlock()
+			return errDirReadInvalidated
+		}
+		if n.listed[d.path] == d.inode {
+			delete(n.listed, d.path)
+		}
+		n.mu.Unlock()
+	}
+	d.read = time.Time{}
+	return nil
+}
+
+// _publishRead commits freshness only if the origin read still belongs to this epoch.
+func (d *Dir) _publishRead(when time.Time, epoch uint64) error {
+	if n := d.vfs.namespace; n != nil {
+		n.mu.Lock()
+		if epoch != n.epoch {
+			n.mu.Unlock()
+			return errDirReadInvalidated
+		}
+		n.listed[d.path] = d.inode
+		d.read = when
+		n.mu.Unlock()
+	} else {
+		d.read = when
+	}
+	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+	return nil
+}
+
 // renameTree renames the directories under this directory
 //
 // path should be the desired path
@@ -367,6 +475,7 @@ func (d *Dir) renameTree(dirPath string) {
 	// Make sure the path is correct for each node
 	if d.path != dirPath {
 		fs.Debugf(d.path, "Renaming to %q", dirPath)
+		d._forgetListing()
 		delete(d.parent.items, name(d.path))
 		d.path = dirPath
 		d.parent.items[name(d.path)] = d
@@ -401,6 +510,7 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.modTimeMu.Unlock()
 	d.mu.Lock()
 	oldPath := d.path
+	d._forgetListing()
 	d.parent = newParent
 	d.entry = fsDir
 	d.path = fsDir.Remote()
@@ -494,6 +604,27 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 	d.addObject(node)
 }
 
+// _addLocalNode installs a local-only entry which shadows anything the remote
+// reports under the same leaf. Call with d.mu held.
+func (d *Dir) _addLocalNode(leaf string, node Node) {
+	if d.local == nil {
+		d.local = make(map[string]struct{})
+	}
+	if d.virtual == nil {
+		d.virtual = make(map[string]vState)
+	}
+	d.items[leaf] = node
+	d.local[leaf] = struct{}{}
+	if _, found := d.virtual[leaf]; !found {
+		d.addVirtual(1)
+	}
+	if node.IsDir() {
+		d.virtual[leaf] = vAddDir
+	} else {
+		d.virtual[leaf] = vAddFile
+	}
+}
+
 // delObject removes an object from the directory
 //
 // The name passed in is marked as virtual as the delete it hasn't been read
@@ -524,21 +655,54 @@ func (d *Dir) DelVirtual(leaf string) {
 }
 
 // read the directory and sets d.items - must be called with the lock held
-func (d *Dir) _readDir() error {
+func (d *Dir) _readDir() (err error) {
 	when := time.Now()
-	if age, stale := d._age(when); stale {
-		if age != 0 {
-			fs.Debugf(d.path, "Re-reading directory (%v old)", age)
-		}
-	} else {
+	age, stale, epoch := d._readState(when)
+	if !stale {
 		return nil
 	}
-	entries, err := list.DirSorted(d.vfs.ctx, d.f, false, d.path)
-	if err == fs.ErrorDirNotFound {
+	if age != 0 {
+		fs.Debugf(d.path, "Re-reading directory (%v old)", age)
+	}
+	dirPath := d.path
+	scoped := d.vfs.namespace != nil
+	if scoped {
+		if pending := d.listing; pending != nil && pending.epoch == epoch && pending.path == dirPath {
+			d.mu.Unlock()
+			select {
+			case <-pending.done:
+			case <-d.vfs.ctx.Done():
+				d.mu.Lock()
+				return d.vfs.ctx.Err()
+			}
+			d.mu.Lock()
+			if pending.err != nil {
+				return pending.err
+			}
+			if _, stale, _ := d._readState(time.Now()); stale {
+				return errDirReadInvalidated
+			}
+			return nil
+		}
+		pending := &dirRead{path: dirPath, epoch: epoch, done: make(chan struct{})}
+		d.listing = pending
+		defer func() {
+			pending.err = err
+			if d.listing == pending {
+				d.listing = nil
+			}
+			close(pending.done)
+		}()
+	}
+	entries, err := d._listSorted(dirPath)
+	if errors.Is(err, fs.ErrorDirNotFound) {
 		// We treat directory not found as empty because we
 		// create directories on the fly
 	} else if err != nil {
 		return err
+	}
+	if d.path != dirPath {
+		return errDirReadInvalidated
 	}
 
 	if d.vfs.Opt.BlockNormDupes { // do this only if requested, as it will have a performance hit
@@ -570,21 +734,35 @@ func (d *Dir) _readDir() error {
 		entries = filteredEntries
 	}
 
-	err = d._readDirFromEntries(entries, nil, time.Time{})
+	if err := d._beginReadPublication(epoch); err != nil {
+		return err
+	}
+	err = d._readDirFromEntries(entries, nil, time.Time{}, epoch)
 	if err != nil {
 		return err
 	}
 
-	d.read = time.Now()
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
+	return d._publishRead(time.Now(), epoch)
+}
 
-	return nil
+func (d *Dir) _listSorted(dirPath string) (fs.DirEntries, error) {
+	if d.vfs.namespace != nil {
+		d.mu.Unlock()
+		defer d.mu.Lock()
+	}
+	return list.DirSorted(d.vfs.ctx, d.f, false, dirPath)
 }
 
 // update d.items for each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time) error {
-	return d._readDirFromEntries(dirTree[d.path], dirTree, when)
+func (d *Dir) _readDirFromDirTree(dirTree dirtree.DirTree, when time.Time, epoch uint64) error {
+	if err := d._beginReadPublication(epoch); err != nil {
+		return err
+	}
+	if err := d._readDirFromEntries(dirTree[d.path], dirTree, when, epoch); err != nil {
+		return err
+	}
+	return d._publishRead(when, epoch)
 }
 
 // Remove the virtual directory entry leaf
@@ -615,6 +793,10 @@ func (d *Dir) _deleteVirtual(name string) {
 func (d *Dir) _purgeVirtual() {
 	canHaveEmptyDirectories := d.f.Features().CanHaveEmptyDirectories
 	for name, virtualState := range d.virtual {
+		if _, localOnly := d.local[name]; localOnly {
+			// A local overlay entry is the only copy of held bytes.
+			continue
+		}
 		switch virtualState {
 		case vAddDir:
 			if canHaveEmptyDirectories {
@@ -724,7 +906,7 @@ func (mv manageVirtuals) end(d *Dir) {
 
 // update d.items and if dirTree is not nil update each dir in the DirTree below this one and
 // set the last read time - must be called with the lock held
-func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
+func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time, epoch uint64) error {
 	var err error
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
@@ -735,6 +917,12 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 		// Check after removing the suffix so "...rclonelink" can't
 		// become an entry called ".."
 		if name == "" || name == "." || name == ".." {
+			continue
+		}
+		if _, localOnly := d.local[name]; localOnly {
+			// The local overlay is the readable copy; the remote entry under
+			// the same leaf must not displace it.
+			mv[name] = struct{}{}
 			continue
 		}
 		node := d.items[name]
@@ -757,16 +945,13 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			}
 			dir := node.(*Dir)
 			dir.mu.Lock()
-			dir.modTime = item.ModTime(d.vfs.ctx)
+			modTime := item.ModTime(d.vfs.ctx)
+			dir.modTimeMu.Lock()
+			dir.modTime = modTime
+			dir.modTimeMu.Unlock()
 			dir.entry = item
 			if dirTree != nil {
-				err = dir._readDirFromDirTree(dirTree, when)
-				if err != nil {
-					dir.read = time.Time{}
-				} else {
-					dir.read = when
-					dir.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
-				}
+				err = dir._readDirFromDirTree(dirTree, when, epoch)
 			}
 			dir.mu.Unlock()
 			if err != nil {
@@ -787,8 +972,9 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 func (d *Dir) readDirTree() error {
 	d.mu.RLock()
 	f, path := d.f, d.path
-	d.mu.RUnlock()
 	when := time.Now()
+	_, _, epoch := d._readState(when)
+	d.mu.RUnlock()
 	fs.Debugf(path, "Reading directory tree")
 	dt, err := walk.NewDirTree(d.vfs.ctx, f, path, false, -1)
 	if err != nil {
@@ -796,14 +982,14 @@ func (d *Dir) readDirTree() error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.read = time.Time{}
-	err = d._readDirFromDirTree(dt, when)
+	if d.path != path {
+		return errDirReadInvalidated
+	}
+	err = d._readDirFromDirTree(dt, when, epoch)
 	if err != nil {
 		return err
 	}
 	fs.Debugf(d.path, "Reading directory tree done in %s", time.Since(when))
-	d.read = when
-	d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
 	return nil
 }
 
@@ -860,6 +1046,34 @@ func (d *Dir) statMetadata(leaf, baseLeaf string) (metaNode Node, err error) {
 	return f, nil
 }
 
+// _localStatLocked resolves a locally held pending node when the origin cannot
+// be listed. Call with d.mu held.
+func (d *Dir) _localStatLocked(leaf string) (Node, bool) {
+	node, ok := d.items[leaf]
+	if !ok {
+		return nil, false
+	}
+	if _, localOnly := d.local[leaf]; localOnly {
+		return node, true
+	}
+	cache := d.vfs.cache
+	if cache == nil {
+		return nil, false
+	}
+	cachePath := path.Join(d.path, leaf)
+	switch n := node.(type) {
+	case *File:
+		if cache.HeldItem(n.CachePath()) != "" || cache.DirtyItem(n.CachePath()) != nil {
+			return node, true
+		}
+	case *Dir:
+		if cache.HeldInTree(cachePath) {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
 // stat a single item in the directory
 //
 // returns ENOENT if not found.
@@ -869,6 +1083,13 @@ func (d *Dir) stat(leaf string) (Node, error) {
 	d.mu.Lock()
 	err := d._readDir()
 	if err != nil {
+		// An exact pending path may resolve from trusted overlay metadata even
+		// when the origin listing fails. The directory itself stays stale and
+		// its listing is never reported as successfully read.
+		if node, ok := d._localStatLocked(leaf); ok {
+			d.mu.Unlock()
+			return node, nil
+		}
 		d.mu.Unlock()
 		return nil, err
 	}
@@ -1126,6 +1347,10 @@ func (d *Dir) Remove() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if d.vfs.cache != nil && d.vfs.cache.HeldInTree(d.path) {
+		fs.Errorf(d, "Dir.Remove refused: protected held local ancestry")
+		return EPERM
+	}
 	// Check directory is empty first
 	empty, err := d.isEmpty()
 	if err != nil {
@@ -1225,6 +1450,10 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 	}
 	// oldName may only match oldNode with case or unicode normalization
 	oldLeaf := oldNode.Name()
+	if d.vfs.cache != nil && d.vfs.cache.HeldInTree(oldPath) {
+		fs.Errorf(oldPath, "Dir.Rename refused: protected held local generation")
+		return EPERM
+	}
 	switch x := oldNode.DirEntry().(type) {
 	case nil:
 		if oldFile, ok := oldNode.(*File); ok {

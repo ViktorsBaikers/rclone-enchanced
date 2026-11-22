@@ -597,13 +597,13 @@ func (f *File) waitForValidObject() (o fs.Object, err error) {
 // openRead open the file for read
 func (f *File) openRead() (fh *ReadFileHandle, err error) {
 	// if o is nil it isn't valid yet
-	_, err = f.waitForValidObject()
+	o, err := f.waitForValidObject()
 	if err != nil {
 		return nil, err
 	}
 	// fs.Debugf(f.Path(), "File.openRead")
 
-	fh, err = newReadFileHandle(f)
+	fh, err = newReadFileHandle(f, o)
 	if err != nil {
 		fs.Debugf(f.Path(), "File.openRead failed: %v", err)
 		return nil, err
@@ -668,6 +668,15 @@ func (f *File) Remove() (err error) {
 
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
+	}
+
+	// A held generation, or the protected local ancestry above it, may not be
+	// removed by a mount caller. Copy-out and read stay available.
+	if d.vfs.cache != nil {
+		if reason := d.vfs.cache.HeldItem(f.CachePath()); reason != "" {
+			fs.Errorf(f._path(), "File.Remove refused held generation: %s", reason)
+			return EPERM
+		}
 	}
 
 	// Remove the object from the cache
