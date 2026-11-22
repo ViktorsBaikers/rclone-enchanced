@@ -18,9 +18,13 @@ import (
 
 // DirCache caches paths to directory IDs and vice versa
 type DirCache struct {
-	cacheMu  sync.RWMutex // protects cache and invCache
-	cache    map[string]string
-	invCache map[string]string
+	cacheMu     sync.RWMutex // protects aliases and namespace state
+	cache       map[string]string
+	invCache    map[string]string
+	epoch       uint64
+	mountRootID string
+	rootLineage map[string]bool
+	pinRoot     bool // immutable after construction
 
 	mu           sync.Mutex // protects the below
 	fs           DirCacher  // Interface to find and make directories
@@ -61,6 +65,84 @@ func New(root string, trueRootID string, fs DirCacher) *DirCache {
 	d.Flush()
 	d.ResetRoot()
 	return d
+}
+
+// NewPinned keeps the first resolved mount root and enables namespace fencing.
+func NewPinned(root, trueRootID string, fs DirCacher) *DirCache {
+	dc := New(root, trueRootID, fs)
+	dc.pinRoot = true
+	return dc
+}
+
+// ErrNamespaceChanged means an origin response crossed an invalidation barrier.
+var ErrNamespaceChanged = errors.New("directory namespace changed during lookup")
+
+// NamespaceEpoch snapshots the namespace before origin I/O.
+func (dc *DirCache) NamespaceEpoch() uint64 {
+	if !dc.pinRoot {
+		return 0
+	}
+	dc.cacheMu.RLock()
+	defer dc.cacheMu.RUnlock()
+	return dc.epoch
+}
+
+// CheckNamespace rejects results obtained before the last namespace barrier.
+func (dc *DirCache) CheckNamespace(epoch uint64) error {
+	if dc.NamespaceEpoch() != epoch {
+		return ErrNamespaceChanged
+	}
+	return nil
+}
+
+// NamespaceView is valid only during an InvalidateNamespace resolver call.
+type NamespaceView struct{ dc *DirCache }
+
+// RootID returns the pinned mount root, or empty if not yet resolved.
+func (v NamespaceView) RootID() string { return v.dc.mountRootID }
+
+// InRootLineage reports an identity whose mutation may affect the mount root.
+func (v NamespaceView) InRootLineage(id string) bool {
+	return id == v.dc.mountRootID || v.dc.rootLineage[id]
+}
+
+// Path looks up an ID in the mount's current aliases.
+func (v NamespaceView) Path(id string) (string, bool) {
+	p, ok := v.dc.invCache[id]
+	return p, ok
+}
+
+// ID looks up a path in the mount's current aliases.
+func (v NamespaceView) ID(p string) (string, bool) {
+	id, ok := v.dc.cache[p]
+	return id, ok
+}
+
+// InvalidateNamespace computes and publishes a memory-only stale barrier.
+// A nil resolver invalidates all aliases except the pinned root. The resolver
+// may use only its view: origin work and downstream callbacks must run outside it.
+func (dc *DirCache) InvalidateNamespace(resolve func(NamespaceView) fs.ChangeScope) fs.ChangeScope {
+	dc.cacheMu.Lock()
+	defer dc.cacheMu.Unlock()
+	scope := fs.ChangeScope{All: true}
+	if resolve != nil {
+		scope = resolve(NamespaceView{dc})
+	}
+	if scope.All {
+		dc.epoch++
+		id := dc.mountRootID
+		if id == "" {
+			id = dc.trueRootID
+		}
+		dc.cache = map[string]string{"": id}
+		dc.invCache = map[string]string{id: ""}
+	} else if len(scope.Parents) != 0 || len(scope.Subtrees) != 0 {
+		dc.epoch++
+		for _, subtree := range scope.Subtrees {
+			dc.flushDirLocked(subtree)
+		}
+	}
+	return scope
 }
 
 // String returns the directory cache in string form for debugging
@@ -113,9 +195,35 @@ func (dc *DirCache) GetInv(id string) (path string, ok bool) {
 // Put a (path, directory ID) pair into the cache
 func (dc *DirCache) Put(path, id string) {
 	dc.cacheMu.Lock()
+	dc.putLocked(path, id)
+	dc.cacheMu.Unlock()
+}
+
+// PutAtEpoch publishes an alias only if the origin result is still current.
+func (dc *DirCache) PutAtEpoch(path, id string, epoch uint64) error {
+	dc.cacheMu.Lock()
+	defer dc.cacheMu.Unlock()
+	if dc.epoch != epoch || !dc.putLocked(path, id) {
+		return ErrNamespaceChanged
+	}
+	return nil
+}
+
+func (dc *DirCache) putLocked(path, id string) bool {
+	if dc.pinRoot {
+		if dc.mountRootID != "" && (path == "") != (id == dc.mountRootID) {
+			return false
+		}
+		if oldPath, ok := dc.invCache[id]; ok && oldPath != path {
+			dc.flushDirLocked(oldPath)
+		}
+		if oldID, ok := dc.cache[path]; ok && oldID != id {
+			dc.flushDirLocked(path)
+		}
+	}
 	dc.cache[path] = id
 	dc.invCache[id] = path
-	dc.cacheMu.Unlock()
+	return true
 }
 
 // Flush the cache of all data
@@ -135,6 +243,9 @@ func (dc *DirCache) Flush() {
 // backends use "0" as a root ID, but it has a real ID which is needed
 // for some operations.
 func (dc *DirCache) SetRootIDAlias(rootID string) {
+	if dc.pinRoot {
+		return
+	}
 	// No locking as this is called from FindLeaf
 	dc.rootID = rootID
 	dc.Put("", dc.rootID)
@@ -150,6 +261,14 @@ func (dc *DirCache) FlushDir(dir string) {
 		return
 	}
 	dc.cacheMu.Lock()
+	if dc.pinRoot {
+		dc.epoch++
+	}
+	dc.flushDirLocked(dir)
+	dc.cacheMu.Unlock()
+}
+
+func (dc *DirCache) flushDirLocked(dir string) {
 
 	// Delete the root dir
 	ID, ok := dc.cache[dir]
@@ -166,8 +285,6 @@ func (dc *DirCache) FlushDir(dir string) {
 			delete(dc.invCache, ID)
 		}
 	}
-
-	dc.cacheMu.Unlock()
 }
 
 // SplitPath splits a path into directory, leaf
@@ -196,26 +313,33 @@ func SplitPath(path string) (directory, leaf string) {
 //
 // It will call FindRoot if it hasn't been called already
 func (dc *DirCache) FindDir(ctx context.Context, path string, create bool) (pathID string, err error) {
+	epoch := dc.NamespaceEpoch()
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	err = dc._findRoot(ctx, create)
+	err = dc._findRoot(ctx, create, epoch)
 	if err != nil {
 		return "", err
 	}
-	return dc._findDir(ctx, path, create)
+	return dc._findDir(ctx, path, create, epoch)
 }
 
 // Unlocked findDir
 //
 // Call with a lock on mu
-func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pathID string, err error) {
+func (dc *DirCache) _findDir(ctx context.Context, path string, create bool, epoch uint64) (pathID string, err error) {
 	// If it is the root, then return it
 	if path == "" {
-		return dc.rootID, nil
+		return dc.rootID, dc.CheckNamespace(epoch)
 	}
 
 	// If it is in the cache then return it
-	pathID, ok := dc.Get(path)
+	dc.cacheMu.RLock()
+	pathID, ok := dc.cache[path]
+	current := dc.epoch == epoch
+	dc.cacheMu.RUnlock()
+	if !current {
+		return "", ErrNamespaceChanged
+	}
 	if ok {
 		return pathID, nil
 	}
@@ -224,7 +348,7 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 	directory, leaf := SplitPath(path)
 
 	// Recurse and find pathID for parent directory
-	parentPathID, err := dc._findDir(ctx, directory, create)
+	parentPathID, err := dc._findDir(ctx, directory, create, epoch)
 	if err != nil {
 		return "", err
 
@@ -233,6 +357,9 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 	// Find the leaf in parentPathID
 	pathID, found, err := dc.fs.FindLeaf(ctx, parentPathID, leaf)
 	if err != nil {
+		return "", err
+	}
+	if err := dc.CheckNamespace(epoch); err != nil {
 		return "", err
 	}
 
@@ -248,10 +375,9 @@ func (dc *DirCache) _findDir(ctx context.Context, path string, create bool) (pat
 		}
 	}
 
-	// Store the leaf directory in the cache
-	dc.Put(path, pathID)
-
-	// fmt.Println("Dir", path, "is", pathID)
+	if err := dc.PutAtEpoch(path, pathID, epoch); err != nil {
+		return "", err
+	}
 	return pathID, nil
 }
 
@@ -286,9 +412,10 @@ func (dc *DirCache) FindPath(ctx context.Context, path string, create bool) (lea
 //
 // If create is set it will make the directory if not found
 func (dc *DirCache) FindRoot(ctx context.Context, create bool) error {
+	epoch := dc.NamespaceEpoch()
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return dc._findRoot(ctx, create)
+	return dc._findRoot(ctx, create, epoch)
 }
 
 // _findRoot finds the root directory if not already found
@@ -298,13 +425,18 @@ func (dc *DirCache) FindRoot(ctx context.Context, create bool) error {
 // If create is set it will make the directory if not found.
 //
 // Call with mu held
-func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
+func (dc *DirCache) _findRoot(ctx context.Context, create bool, epoch uint64) error {
 	if dc.foundRoot {
-		return nil
+		return dc.CheckNamespace(epoch)
 	}
-	rootID, err := dc._findDir(ctx, dc.root, create)
+	rootID, err := dc._findDir(ctx, dc.root, create, epoch)
 	if err != nil {
 		return err
+	}
+	dc.cacheMu.Lock()
+	defer dc.cacheMu.Unlock()
+	if dc.epoch != epoch {
+		return ErrNamespaceChanged
 	}
 	dc.foundRoot = true
 	dc.rootID = rootID
@@ -312,12 +444,20 @@ func (dc *DirCache) _findRoot(ctx context.Context, create bool) error {
 	// Find the parent of the root while we still have the root
 	// directory tree cached
 	rootParentPath, _ := SplitPath(dc.root)
-	dc.rootParentID, _ = dc.Get(rootParentPath)
+	dc.rootParentID = dc.cache[rootParentPath]
+	if dc.pinRoot {
+		dc.mountRootID = rootID
+		if rootParentPath != "" {
+			dc.rootLineage = make(map[string]bool)
+			for parent := rootParentPath; parent != ""; parent, _ = SplitPath(parent) {
+				dc.rootLineage[dc.cache[parent]] = true
+			}
+		}
+	}
 
 	// Reset the tree based on dc.root
-	dc.Flush()
-	// Put the root directory in
-	dc.Put("", dc.rootID)
+	dc.cache = map[string]string{"": rootID}
+	dc.invCache = map[string]string{rootID: ""}
 	return nil
 }
 
@@ -332,9 +472,10 @@ func (dc *DirCache) FoundRoot() bool {
 //
 // If create is set it will make the root directory if not found
 func (dc *DirCache) RootID(ctx context.Context, create bool) (ID string, err error) {
+	epoch := dc.NamespaceEpoch()
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	err = dc._findRoot(ctx, create)
+	err = dc._findRoot(ctx, create, epoch)
 	if err != nil {
 		return "", err
 	}
@@ -345,6 +486,7 @@ func (dc *DirCache) RootID(ctx context.Context, create bool) (ID string, err err
 //
 // If create is set it will make the root parent directory if not found (but not the root)
 func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, err error) {
+	epoch := dc.NamespaceEpoch()
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	if !dc.foundRoot {
@@ -353,7 +495,7 @@ func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, e
 		}
 		// Find the rootParentID without creating the root
 		rootParent, _ := SplitPath(dc.root)
-		rootParentID, err := dc._findDir(ctx, rootParent, create)
+		rootParentID, err := dc._findDir(ctx, rootParent, create, epoch)
 		if err != nil {
 			return "", err
 		}
@@ -361,12 +503,15 @@ func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, e
 	} else if dc.rootID == dc.trueRootID {
 		return "", errors.New("is root directory")
 	}
-	return dc.rootParentID, nil
+	return dc.rootParentID, dc.CheckNamespace(epoch)
 }
 
-// ResetRoot resets the root directory to the absolute root and clears
-// the DirCache
+// ResetRoot clears the cache and resets root discovery unless the root is pinned.
 func (dc *DirCache) ResetRoot() {
+	if dc.pinRoot {
+		dc.InvalidateNamespace(nil)
+		return
+	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	dc.foundRoot = false
