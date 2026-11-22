@@ -15,7 +15,7 @@ source "$ROOT_DIR/teldrive-enchanced/scripts/b6/lib.sh"
 export LC_ALL=C
 umask 077
 
-ALL_SCENES=(empty unicode case rename)
+ALL_SCENES=(empty unicode case rename rename-open large)
 SNAPSHOT=""
 RECEIPT=""
 IMAGE=""
@@ -59,7 +59,7 @@ bind the supplied snapshot and image.
                         (default: $B6_PRIVATE_DIR/linux-docker-receipt.json)
   --image TAG           sealed TelDrive image (default: receipt tag)
   --out DIR             receipt directory (default: <receipt dir>/mount)
-  --scene NAME          repeatable; any of: empty unicode case rename
+  --scene NAME          repeatable; any of: empty unicode case rename rename-open large
   --server-url URL      existing disposable server (skips container start)
   --api-key-file PATH   API key for --server-url
   --keep                keep the private work root
@@ -201,6 +201,16 @@ RCLONE_UPSTREAM="$(jq -r '.metadata.upstream_base // empty' "$BUILD_RECEIPT")"
 
 # --- helpers ---------------------------------------------------------------
 hash_of() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# Deterministic pseudo-random bytes via AES-256-CTR with a fixed key and IV.
+gen_det() {
+  local out="$1" bytes="$2"
+  head -c "$bytes" /dev/zero |
+    openssl enc -aes-256-ctr \
+      -K 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f \
+      -iv 000102030405060708090a0b0c0d0e0f -nosalt -out "$out" || return 1
+  [[ "$(stat -c %s "$out")" == "$bytes" ]]
+}
 
 add_read() { BYTES_READ=$((BYTES_READ + $1)); SCENE_BYTES_READ=$((SCENE_BYTES_READ + $1)); }
 add_write() { BYTES_WRITTEN=$((BYTES_WRITTEN + $1)); SCENE_BYTES_WRITTEN=$((SCENE_BYTES_WRITTEN + $1)); }
@@ -553,6 +563,97 @@ scene_rename() {
   SCENE_SHA256="$(hash_of "$got")"
   SCENE_EXPECTED_SHA256="$(hash_of "$src")"
   SCENE_FILES="dir-b/renamed.txt"
+  [[ "$SCENE_SHA256" == "$SCENE_EXPECTED_SHA256" ]] ||
+    { SCENE_REASON="SHA-256 differs ($SCENE_SHA256 != $SCENE_EXPECTED_SHA256)"; return 1; }
+  return 0
+}
+
+scene_rename-open() {
+  SCENE_OPERATION="open a 32 MiB file, rename it through a second process, hash the open read, rclone move, independent copy"
+  local src="$WORK/src/rename-open.bin" dl="$WORK/dl/rename-open"
+  local hashfile="$WORK/rename-open.sha" errfile="$WORK/rename-open.err"
+  local opid st waited note=""
+  gen_det "$src" 33554432 || { SCENE_REASON="deterministic source generation failed"; return 1; }
+  cp "$src" "$MOUNT/ro.bin" || { SCENE_REASON="could not write ro.bin"; return 1; }
+  add_write "$(stat -c %s "$src")"
+  limit_check || { SCENE_REASON="impact limit: $LIMIT_STATE"; return 1; }
+  : > "$hashfile"
+  : > "$errfile"
+  (
+    exec 3<"$MOUNT/ro.bin" || exit 1
+    sleep 0.5
+    cat <&3 | sha256sum > "$hashfile"
+  ) 2>"$errfile" &
+  opid=$!
+  sleep 0.2
+  if ! mv "$MOUNT/ro.bin" "$MOUNT/ro-renamed.bin"; then
+    kill -9 "$opid" 2>/dev/null || true
+    SCENE_REASON="rename of the open file failed"
+    return 1
+  fi
+  waited=0
+  while kill -0 "$opid" 2>/dev/null; do
+    if (( waited >= 120 )); then
+      kill -9 "$opid" 2>/dev/null || true
+      SCENE_REASON="rename-while-open read hung past 30 s"
+      return 1
+    fi
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  wait "$opid"
+  st=$?
+  local read_sha="" expected_src empty_sha
+  [[ -s "$hashfile" ]] && read_sha="$(cut -d' ' -f1 "$hashfile")"
+  expected_src="$(hash_of "$src")"
+  empty_sha="$(printf '' | sha256sum | cut -d' ' -f1)"
+  if [[ "$st" -ne 0 && ( -z "$read_sha" || "$read_sha" == "$empty_sha" ) ]]; then
+    note="clean read failure (exit $st, no partial content)"
+  elif [[ "$read_sha" != "$expected_src" ]]; then
+    SCENE_REASON="open-file read returned wrong bytes (${read_sha:-none} != $expected_src)"
+    return 1
+  else
+    note="open read preserved the original bytes"
+  fi
+  limit_check || { SCENE_REASON="impact limit: $LIMIT_STATE"; return 1; }
+  account_transfer "$(stat -c %s "$src")"
+  rc move "$MOUNT/ro-renamed.bin" "td:verify/rename-open/" >/dev/null 2>&1 ||
+    { SCENE_REASON="rclone move failed"; return 1; }
+  mkdir -p "$dl"
+  rc copy "td:verify/rename-open" "$dl" >/dev/null 2>&1 ||
+    { SCENE_REASON="independent copy failed"; return 1; }
+  [[ -f "$dl/ro-renamed.bin" ]] ||
+    { SCENE_REASON="downloaded ro-renamed.bin missing"; return 1; }
+  add_read "$(stat -c %s "$dl/ro-renamed.bin")"
+  SCENE_SHA256="$(hash_of "$dl/ro-renamed.bin")"
+  SCENE_EXPECTED_SHA256="$expected_src"
+  SCENE_FILES="ro-renamed.bin"
+  SCENE_REASON="$note"
+  [[ "$SCENE_SHA256" == "$SCENE_EXPECTED_SHA256" ]] ||
+    { SCENE_REASON="SHA-256 differs ($SCENE_SHA256 != $SCENE_EXPECTED_SHA256)"; return 1; }
+  return 0
+}
+
+scene_large() {
+  SCENE_OPERATION="write exactly 64 MiB, rclone move, independent full copy"
+  local src="$WORK/src/large.bin" dl="$WORK/dl/large" size=67108864
+  gen_det "$src" "$size" || { SCENE_REASON="deterministic source generation failed"; return 1; }
+  cp "$src" "$MOUNT/large.bin" || { SCENE_REASON="could not write large.bin"; return 1; }
+  add_write "$size"
+  [[ "$(stat -c %s "$MOUNT/large.bin")" == "$size" ]] ||
+    { SCENE_REASON="large file size through the mount is not 64 MiB"; return 1; }
+  limit_check || { SCENE_REASON="impact limit: $LIMIT_STATE"; return 1; }
+  account_transfer "$size"
+  rc move "$MOUNT/large.bin" "td:verify/large/" >/dev/null 2>&1 ||
+    { SCENE_REASON="rclone move failed"; return 1; }
+  mkdir -p "$dl"
+  rc copy "td:verify/large" "$dl" >/dev/null 2>&1 ||
+    { SCENE_REASON="independent copy failed"; return 1; }
+  [[ -f "$dl/large.bin" ]] || { SCENE_REASON="downloaded large.bin missing"; return 1; }
+  add_read "$(stat -c %s "$dl/large.bin")"
+  SCENE_SHA256="$(hash_of "$dl/large.bin")"
+  SCENE_EXPECTED_SHA256="$(hash_of "$src")"
+  SCENE_FILES="large.bin"
   [[ "$SCENE_SHA256" == "$SCENE_EXPECTED_SHA256" ]] ||
     { SCENE_REASON="SHA-256 differs ($SCENE_SHA256 != $SCENE_EXPECTED_SHA256)"; return 1; }
   return 0
