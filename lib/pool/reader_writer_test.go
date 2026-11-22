@@ -650,3 +650,21 @@ func TestRWUseAfterClose(t *testing.T) {
 	_, err = rw.Read(buf)
 	assert.ErrorIs(t, err, ErrClosed)
 }
+
+// Check that Account returns the accounting callback's error and passes n through.
+func TestRWAccount(t *testing.T) {
+	planted := errors.New("planted accounting error")
+	rw := NewRW(rwPool)
+	defer func() { assert.NoError(t, rw.Close()) }()
+
+	assert.NoError(t, rw.Account(1))
+
+	var got int
+	rw.SetAccounting(func(n int) error {
+		got = n
+		return planted
+	})
+	err := rw.Account(7)
+	assert.ErrorIs(t, err, planted)
+	assert.Equal(t, 7, got)
+}
