@@ -11,6 +11,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/rc"
@@ -112,6 +113,65 @@ func TestJobsExecuteIDs(t *testing.T) {
 	assert.Equal(t, executeID, job1.ExecuteID, "execute ID should match global executeID")
 	assert.Equal(t, executeID, job2.ExecuteID, "execute ID should match global executeID")
 	assert.True(t, job1.ExecuteID == job2.ExecuteID, "just to be sure, all the jobs share the same executeID")
+}
+
+func TestJobIsRunningRetainedAndExpired(t *testing.T) {
+	require.NotNil(t, cache.JobIsRunning)
+	require.False(t, cache.JobIsRunning(0))
+	require.False(t, cache.JobIsRunning(-1))
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	job, _, err := NewJob(t.Context(), func(ctx context.Context, _ rc.Params) (rc.Params, error) {
+		started <- ctx
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil, nil
+	}, rc.Params{"_async": true})
+	require.NoError(t, err)
+	t.Cleanup(job.Stop)
+	_, err = OnFinish(job.ID, func() { close(finished) })
+	require.NoError(t, err)
+	var origin context.Context
+	select {
+	case origin = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("RC job did not start")
+	}
+	copied := fs.CopyConfig(context.Background(), fs.CopyConfig(context.Background(), origin))
+	require.True(t, cache.JobIsRunning(job.ID))
+	require.True(t, IsRunning(job.ID))
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("RC job did not finish")
+	}
+	require.Same(t, job, running.Get(job.ID))
+	for _, ctx := range []context.Context{origin, copied} {
+		id, ok := cache.JobGetJobID(fs.UploadAdmissionJobContext(ctx))
+		require.True(t, ok)
+		require.Equal(t, job.ID, id)
+		require.False(t, cache.JobIsRunning(id))
+		require.NoError(t, ctx.Err(), "finishing a job must not cancel retained contexts")
+	}
+	running.mu.Lock()
+	job.mu.Lock()
+	job.EndTime = time.Now().Add(-time.Duration(running.opt.JobExpireDuration) - time.Second)
+	job.mu.Unlock()
+	running.mu.Unlock()
+	running.Expire()
+	require.Nil(t, running.Get(job.ID))
+	for _, ctx := range []context.Context{origin, copied} {
+		id, ok := cache.JobGetJobID(fs.UploadAdmissionJobContext(ctx))
+		require.True(t, ok, "expiry removes retention, not private context identity")
+		require.Equal(t, job.ID, id)
+		require.False(t, cache.JobIsRunning(id))
+	}
+	_, err = OnFinish(job.ID, func() {})
+	require.Error(t, err)
 }
 
 func TestJobsGet(t *testing.T) {

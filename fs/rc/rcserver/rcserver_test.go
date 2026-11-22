@@ -376,6 +376,63 @@ func TestRemoteServing(t *testing.T) {
 	testServer(t, tests, &opt)
 }
 
+// TestServeRemoteBracketNames checks that a bracketed file name stays in the
+// path instead of being eaten by the remote delimiter. It uses a temporary
+// remote so the shared golden fixtures are untouched.
+func TestServeRemoteBracketNames(t *testing.T) {
+	dir := t.TempDir()
+	name := "clip[1080p].mkv"
+	body := "bracketed body\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
+	url := "[" + dir + "]/" + name
+
+	opt := newTestOpt()
+	opt.Serve = true
+	opt.NoAuth = true
+	testServer(t, []testRun{{
+		Name:     "full",
+		URL:      url,
+		Status:   http.StatusOK,
+		Expected: body,
+	}, {
+		Name:     "range",
+		URL:      url,
+		Status:   http.StatusPartialContent,
+		Range:    "bytes=0-8",
+		Expected: "bracketed",
+	}}, &opt)
+}
+
+// TestFSMatchDelimiter pins the remote delimiter: the remote group ends at the
+// first closing bracket, so brackets in a file name stay in the path.
+// A config section name containing "]" cannot be delimited by this grammar;
+// that matches upstream and is not special-cased.
+func TestFSMatchDelimiter(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		in     string
+		remote string
+		path   string
+	}{
+		{name: "plain", in: "[remote]/a/b.mkv", remote: "remote", path: "/a/b.mkv"},
+		{name: "bracket name", in: "[remote]/Movie[1080p].mkv", remote: "remote", path: "/Movie[1080p].mkv"},
+		{name: "colon remote", in: "[teldrive:]/a/b [x].mkv", remote: "teldrive:", path: "/a/b [x].mkv"},
+		{name: "bracket before delimiter", in: "[remote]/a]b.mkv", remote: "remote", path: "/a]b.mkv"},
+		{name: "no match", in: "no/brackets.mkv", remote: "", path: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := fsMatch.FindStringSubmatch(test.in)
+			if test.remote == "" {
+				assert.Nil(t, got)
+				return
+			}
+			require.Len(t, got, 3)
+			assert.Equal(t, test.remote, got[1])
+			assert.Equal(t, test.path, got[2])
+		})
+	}
+}
+
 // TestCheckServeRemote must reject request-derived backend instantiation on the
 // unauthenticated file-serving path, and global.* config mutation.
 func TestCheckServeRemote(t *testing.T) {

@@ -27,6 +27,7 @@ import (
 func init() {
 	cache.JobOnFinish = OnFinish
 	cache.JobGetJobID = GetJobID
+	cache.JobIsRunning = IsRunning
 }
 
 // Job describes an asynchronous task started via the rc package
@@ -327,6 +328,17 @@ func OnFinish(jobID int64, fn func()) (func(), error) {
 		return func() {}, errors.New("job not found")
 	}
 	return job.OnFinish(fn), nil
+}
+
+// IsRunning reports whether a retained job has not finished.
+func IsRunning(jobID int64) bool {
+	job := running.Get(jobID)
+	if job == nil {
+		return false
+	}
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	return !job.Finished
 }
 
 // GetJob gets the Job from the context if possible
