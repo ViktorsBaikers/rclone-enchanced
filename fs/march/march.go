@@ -4,6 +4,7 @@ package march
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -576,9 +577,10 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 
 	// Wait for listings to complete and report errors
 	wg.Wait()
+	var lookupErrs []error
 	lookupErrors.Range(func(_, value any) bool {
-		dstListErr = value.(error)
-		return false
+		lookupErrs = append(lookupErrs, value.(error))
+		return true
 	})
 	if srcListErr != nil {
 		if job.srcRemote != "" {
@@ -589,19 +591,25 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 		srcListErr = fs.CountError(m.Ctx, srcListErr)
 		return nil, srcListErr
 	}
-	if dstListCancelled {
-		// Ignore dst listing errors if we cancelled it
-	} else if dstListErr == fs.ErrorDirNotFound {
-		// Copy the stuff anyway
-	} else if dstListErr != nil {
+	if dstListCancelled || dstListErr == fs.ErrorDirNotFound {
+		// Ignore the destination listing error: the listing was
+		// cancelled, or the directory does not exist so copy anyway.
+		dstListErr = nil
+	}
+	if err := joinDestinationErrors(dstListErr, lookupErrs); err != nil {
 		if job.dstRemote != "" {
-			fs.ErrorfCtx(m.Ctx, job.dstRemote, "error reading destination directory: %v", dstListErr)
+			fs.ErrorfCtx(m.Ctx, job.dstRemote, "error reading destination directory: %v", err)
 		} else {
-			fs.ErrorfCtx(m.Ctx, m.Fdst, "error reading destination root directory: %v", dstListErr)
+			fs.ErrorfCtx(m.Ctx, m.Fdst, "error reading destination root directory: %v", err)
 		}
-		dstListErr = fs.CountError(m.Ctx, dstListErr)
-		return nil, dstListErr
+		return nil, fs.CountError(m.Ctx, err)
 	}
 
 	return jobs, nil
+}
+
+// joinDestinationErrors joins the destination listing error with every
+// destination lookup error so no cause masks another.
+func joinDestinationErrors(dstListErr error, lookupErrs []error) error {
+	return errors.Join(append([]error{dstListErr}, lookupErrs...)...)
 }
