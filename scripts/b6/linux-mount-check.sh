@@ -18,11 +18,13 @@ umask 077
 ALL_SCENES=(empty unicode case rename rename-open large)
 SNAPSHOT=""
 RECEIPT=""
+BUILD_RECEIPT=""
 IMAGE=""
 OUT=""
 KEEP=false
 SERVER_URL=""
 API_KEY_FILE=""
+SELF_TEST=false
 SCENES=()
 
 LIMIT_SECONDS=180
@@ -57,12 +59,16 @@ bind the supplied snapshot and image.
   --snapshot DIR        sealed snapshot (default: receipt snapshot_path)
   --receipt PATH        plan 07-05 receipt
                         (default: $B6_PRIVATE_DIR/linux-docker-receipt.json)
+  --build-receipt PATH  build receipt bound to this snapshot
+                        (default: <snapshot parent>/work-<snapshot>/receipt.json)
   --image TAG           sealed TelDrive image (default: receipt tag)
   --out DIR             receipt directory (default: <receipt dir>/mount)
   --scene NAME          repeatable; any of: empty unicode case rename rename-open large
   --server-url URL      existing disposable server (skips container start)
   --api-key-file PATH   API key for --server-url
   --keep                keep the private work root
+  --self-test           prove read classification, key parsing, and directory
+                        validation without a mount or a container
 EOF
   exit 2
 }
@@ -75,20 +81,141 @@ fail() {
   exit 1
 }
 
+# Classify one open-reader outcome from its exit status and the bytes it wrote
+# to TEMP_FILE. A reader is never piped into sha256sum: that hides its status.
+# Prints preserved | clean-failure | partial-failure | empty-read | wrong-bytes.
+# Returns 0 preserved, 2 read failure with no usable bytes, 1 wrong bytes.
+mount_classify_read() {
+  local status="$1" expected="$2" empty="$3" errfile="$4" tempfile="$5"
+  local read_sha
+  read_sha="$(sha256sum -- "$tempfile" | cut -d' ' -f1)"
+  if (( status != 0 )) && [[ -s "$errfile" ]]; then
+    printf 'b6-mount: reader stderr: %s\n' "$(head -n 1 -- "$errfile")" >&2
+  fi
+  if (( status == 0 )); then
+    if [[ "$read_sha" == "$empty" ]]; then
+      printf 'empty-read'
+      return 1
+    fi
+    if [[ "$read_sha" == "$expected" ]]; then
+      printf 'preserved'
+      return 0
+    fi
+    printf 'wrong-bytes'
+    return 1
+  fi
+  if [[ "$read_sha" == "$empty" ]]; then
+    printf 'clean-failure'
+    return 2
+  fi
+  printf 'partial-failure'
+  return 2
+}
+
+# Read exactly one API-key line. Multi-line and empty files are refused so a
+# joined key never reaches a config file (IN-05).
+mount_read_api_key() {
+  local file="$1"
+  local -a lines=()
+  mapfile -t lines < "$file"
+  if (( ${#lines[@]} != 1 )) || [[ -z "${lines[0]}" ]]; then
+    printf 'api-key-multiline'
+    return 1
+  fi
+  printf '%s' "${lines[0]}"
+}
+
+self_test() {
+  local tmp failures=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/b6-mount-selftest.XXXXXX")"
+
+  local expected empty
+  printf 'payload-bytes' > "$tmp/full"
+  : > "$tmp/none"
+  printf 'partial' > "$tmp/partial"
+  printf 'wrong' > "$tmp/wrong"
+  : > "$tmp/err"
+  expected="$(sha256sum "$tmp/full" | cut -d' ' -f1)"
+  empty="$(printf '' | sha256sum | cut -d' ' -f1)"
+
+  expect() {
+    local name="$1" want_rc="$2" want_out="$3"
+    shift 3
+    local got_rc got_out
+    got_out="$("$@")" && got_rc=0 || got_rc=$?
+    if [[ "$got_rc" -ne "$want_rc" || "$got_out" != "$want_out" ]]; then
+      printf 'self-test: FAIL %s -> rc=%s out=%s (want rc=%s out=%s)\n' \
+        "$name" "$got_rc" "$got_out" "$want_rc" "$want_out" >&2
+      failures=$((failures + 1))
+      return 0
+    fi
+    printf 'self-test: PASS %s\n' "$name"
+  }
+
+  expect "status 0 matching bytes preserved" 0 preserved \
+    mount_classify_read 0 "$expected" "$empty" "$tmp/err" "$tmp/full"
+  expect "non-zero empty read is a clean failure" 2 clean-failure \
+    mount_classify_read 1 "$expected" "$empty" "$tmp/err" "$tmp/none"
+  expect "non-zero partial read is a clean failure" 2 partial-failure \
+    mount_classify_read 1 "$expected" "$empty" "$tmp/err" "$tmp/partial"
+  expect "status 0 empty read is not preserved" 1 empty-read \
+    mount_classify_read 0 "$expected" "$empty" "$tmp/err" "$tmp/none"
+  expect "status 0 different bytes are wrong bytes" 1 wrong-bytes \
+    mount_classify_read 0 "$expected" "$empty" "$tmp/err" "$tmp/wrong"
+
+  printf 'tdk_single_line\n' > "$tmp/key"
+  expect "single-line key accepted" 0 tdk_single_line mount_read_api_key "$tmp/key"
+  printf 'tdk_first\ntdk_second\n' > "$tmp/key-multi"
+  expect "multi-line key rejected" 1 api-key-multiline mount_read_api_key "$tmp/key-multi"
+  : > "$tmp/key-empty"
+  expect "empty key rejected" 1 api-key-multiline mount_read_api_key "$tmp/key-empty"
+
+  mkdir -m 755 "$tmp/out-755"
+  expect "existing 0755 output directory refused" 1 "" \
+    b6_ensure_private_dir "$tmp/out-755"
+  if [[ "$(stat -c %a "$tmp/out-755")" == 755 ]]; then
+    printf 'self-test: PASS existing output mode unchanged\n'
+  else
+    printf 'self-test: FAIL existing output mode was changed\n' >&2
+    failures=$((failures + 1))
+  fi
+  expect "absent output directory created" 0 "" b6_ensure_private_dir "$tmp/out-new"
+  [[ "$(stat -c %a "$tmp/out-new")" == 700 ]] ||
+    { printf 'self-test: FAIL new output directory is not 0700\n' >&2; failures=$((failures + 1)); }
+  expect "existing 0700 output directory accepted" 0 "" \
+    b6_ensure_private_dir "$tmp/out-new"
+
+  if (( failures == 0 )); then
+    rm -rf -- "$tmp"
+    printf 'self-test: PASS\n'
+    return 0
+  fi
+  rm -rf -- "$tmp"
+  printf 'self-test: FAIL (%d)\n' "$failures" >&2
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --snapshot) [[ $# -ge 2 ]] || usage; SNAPSHOT="$2"; shift 2 ;;
     --receipt) [[ $# -ge 2 ]] || usage; RECEIPT="$2"; shift 2 ;;
+    --build-receipt) [[ $# -ge 2 ]] || usage; BUILD_RECEIPT="$2"; shift 2 ;;
     --image) [[ $# -ge 2 ]] || usage; IMAGE="$2"; shift 2 ;;
     --out) [[ $# -ge 2 ]] || usage; OUT="$2"; shift 2 ;;
     --scene) [[ $# -ge 2 ]] || usage; SCENES+=("$2"); shift 2 ;;
     --server-url) [[ $# -ge 2 ]] || usage; SERVER_URL="$2"; shift 2 ;;
     --api-key-file) [[ $# -ge 2 ]] || usage; API_KEY_FILE="$2"; shift 2 ;;
     --keep) KEEP=true; shift ;;
+    --self-test) SELF_TEST=true; shift ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
+
+if [[ "$SELF_TEST" == true ]]; then
+  self_test
+  exit $?
+fi
 
 if [[ ${#SCENES[@]} -eq 0 ]]; then
   SCENES=("${ALL_SCENES[@]}")
@@ -111,7 +238,8 @@ PRIV="$(b6_private_root)"
 # directory and always receives receipt.json.
 [[ -n "$RECEIPT" ]] || RECEIPT="$PRIV/linux-docker-receipt.json"
 [[ -n "$OUT" ]] || OUT="$(dirname -- "$RECEIPT")/mount"
-install -d -m 0700 "$PRIV" "$OUT"
+b6_ensure_private_dir "$PRIV"
+b6_ensure_private_dir "$OUT"
 RECEIPT_OUT="$OUT/receipt.json"
 [[ "$RECEIPT_OUT" != "$RECEIPT" ]] || fail "--out would overwrite the plan 07-05 receipt"
 
@@ -128,12 +256,15 @@ SNAP_RECEIPT_ABS="$(cd -- "$SNAP_FROM_RECEIPT" 2>/dev/null && pwd)"
 [[ -n "$IMAGE" ]] || IMAGE="$(jq -er '.server_image_tag' "$RECEIPT")" || fail "receipt has no server_image_tag"
 RECEIPT_IMAGE_TAG="$(jq -er '.server_image_tag' "$RECEIPT")" || fail "receipt has no server_image_tag"
 [[ "$IMAGE" == "$RECEIPT_IMAGE_TAG" ]] || fail "image argument does not equal receipt server_image_tag"
-SNAP_SEAL_SHA="$(sha256sum "$SNAP/snapshot.sha256" | cut -d' ' -f1)"
-RECEIPT_SNAP_SHA="$(jq -er '.snapshot_sha256' "$RECEIPT")" || fail "receipt has no snapshot_sha256"
-[[ "$SNAP_SEAL_SHA" == "$RECEIPT_SNAP_SHA" ]] ||
-  fail "snapshot seal digest does not match the receipt"
+SNAP_FILE_SHA="$(sha256sum "$SNAP/snapshot.sha256" | cut -d' ' -f1)"
 SNAP_DIGEST="$(cat "$SNAP/snapshot.sha256")"
 [[ "$SNAP_DIGEST" =~ ^[0-9a-f]{64}$ ]] || fail "snapshot digest is not a sha256"
+RECEIPT_SNAP_SHA="$(jq -er '.snapshot_sha256' "$RECEIPT")" || fail "receipt has no snapshot_sha256"
+[[ "$SNAP_DIGEST" == "$RECEIPT_SNAP_SHA" ]] ||
+  fail "snapshot-digest-mismatch: receipt snapshot_sha256 is not the seal digest"
+RECEIPT_SNAP_FILE_SHA="$(jq -r '.snapshot_file_sha256 // empty' "$RECEIPT")"
+[[ -z "$RECEIPT_SNAP_FILE_SHA" || "$RECEIPT_SNAP_FILE_SHA" == "$SNAP_FILE_SHA" ]] ||
+  fail "snapshot-digest-mismatch: receipt snapshot_file_sha256 does not match the manifest file"
 RECEIPT_IMAGE_DIGEST="$(jq -er '.server_image_digest' "$RECEIPT")" || fail "receipt has no server_image_digest"
 
 if [[ -z "$SERVER_URL" ]]; then
@@ -150,12 +281,12 @@ fi
 
 # --- Missing facilities are a recorded NOT-RUN, never a silent skip ---------
 if [[ ! -e /dev/fuse ]]; then
-  jq -n --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_SEAL_SHA" \
-    --arg snapshot_digest "$SNAP_DIGEST" --arg image "$IMAGE" --arg image_id "$IMAGE_ID" \
+  jq -n --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_DIGEST" \
+    --arg snapshot_file_sha256 "$SNAP_FILE_SHA" --arg image "$IMAGE" --arg image_id "$IMAGE_ID" \
     --arg reason "missing /dev/fuse" \
     '{plan:"07-06", outcome:"NOT-RUN", reason:$reason, facility:"fuse",
       snapshot_path:$snapshot_path, snapshot_sha256:$snapshot_sha256,
-      snapshot_digest:$snapshot_digest, server_image_tag:$image,
+      snapshot_file_sha256:$snapshot_file_sha256, server_image_tag:$image,
       server_image_digest:$image_id, scenes:[], impact_limits:{seconds:180,bytes:8589934592},
       limit_state:"none", production_touched:false}' > "$RECEIPT_OUT"
   chmod 600 "$RECEIPT_OUT"
@@ -165,12 +296,12 @@ if [[ ! -e /dev/fuse ]]; then
 fi
 
 if ! command -v fusermount3 >/dev/null 2>&1; then
-  jq -n --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_SEAL_SHA" \
-    --arg snapshot_digest "$SNAP_DIGEST" --arg image "$IMAGE" --arg image_id "$IMAGE_ID" \
+  jq -n --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_DIGEST" \
+    --arg snapshot_file_sha256 "$SNAP_FILE_SHA" --arg image "$IMAGE" --arg image_id "$IMAGE_ID" \
     --arg reason "missing fusermount3" \
     '{plan:"07-06", outcome:"NOT-RUN", reason:$reason, facility:"fusermount3",
       snapshot_path:$snapshot_path, snapshot_sha256:$snapshot_sha256,
-      snapshot_digest:$snapshot_digest, server_image_tag:$image,
+      snapshot_file_sha256:$snapshot_file_sha256, server_image_tag:$image,
       server_image_digest:$image_id, scenes:[], impact_limits:{seconds:180,bytes:8589934592},
       limit_state:"none", production_touched:false}' > "$RECEIPT_OUT"
   chmod 600 "$RECEIPT_OUT"
@@ -182,7 +313,7 @@ fi
 # --- rclone artifact built from the same sealed snapshot -------------------
 BUILD_WORK="$(dirname -- "$SNAP")/work-$(basename -- "$SNAP")"
 RCLONE_BIN="$BUILD_WORK/out1/rclone"
-BUILD_RECEIPT="$BUILD_WORK/receipt.json"
+[[ -n "$BUILD_RECEIPT" ]] || BUILD_RECEIPT="$BUILD_WORK/receipt.json"
 if [[ ! -x "$RCLONE_BIN" ]]; then
   log "building rclone from the sealed snapshot"
   "$ROOT_DIR/teldrive-enchanced/scripts/b6/build-repro.sh" --snapshot "$SNAP" --native rclone ||
@@ -190,6 +321,13 @@ if [[ ! -x "$RCLONE_BIN" ]]; then
 fi
 [[ -x "$RCLONE_BIN" ]] || fail "rclone artifact not found at $RCLONE_BIN"
 [[ -s "$BUILD_RECEIPT" ]] || fail "build receipt not found at $BUILD_RECEIPT"
+BUILD_SNAP_DIGEST="$(jq -er '.snapshot_sha256' "$BUILD_RECEIPT")" ||
+  fail "build receipt has no snapshot_sha256"
+[[ "$BUILD_SNAP_DIGEST" == "$SNAP_DIGEST" ]] ||
+  fail "snapshot-digest-mismatch: build receipt snapshot_sha256 is not the seal digest"
+BUILD_SNAP_FILE_SHA="$(jq -r '.snapshot_file_sha256 // empty' "$BUILD_RECEIPT")"
+[[ -z "$BUILD_SNAP_FILE_SHA" || "$BUILD_SNAP_FILE_SHA" == "$SNAP_FILE_SHA" ]] ||
+  fail "snapshot-digest-mismatch: build receipt snapshot_file_sha256 does not match the manifest file"
 RCLONE_ARTIFACT_SHA="$(sha256sum "$RCLONE_BIN" | cut -d' ' -f1)"
 RECEIPT_ARTIFACT_SHA="$(jq -er '.artifacts["rclone-enchanced"].artifact_sha256_run1' "$BUILD_RECEIPT")" ||
   fail "build receipt has no rclone artifact digest"
@@ -276,7 +414,8 @@ add_row() {
     --arg files "$SCENE_FILES" \
     --arg limit_state "$LIMIT_STATE" \
     --arg snapshot_path "$SNAP" \
-    --arg snapshot_sha256 "$SNAP_SEAL_SHA" \
+    --arg snapshot_sha256 "$SNAP_DIGEST" \
+    --arg snapshot_file_sha256 "$SNAP_FILE_SHA" \
     --arg rclone_artifact_sha256 "$RCLONE_ARTIFACT_SHA" \
     --arg server_image_digest "$IMAGE_ID" \
     --arg go_version "$GO_VERSION" \
@@ -285,7 +424,8 @@ add_row() {
       bytes_read:$bytes_read, bytes_written:$bytes_written, elapsed_seconds:$elapsed,
       sha256:$sha256, expected_sha256:$expected_sha256, files:$files,
       limit_state:$limit_state, snapshot_path:$snapshot_path,
-      snapshot_sha256:$snapshot_sha256, rclone_artifact_sha256:$rclone_artifact_sha256,
+      snapshot_sha256:$snapshot_sha256, snapshot_file_sha256:$snapshot_file_sha256,
+      rclone_artifact_sha256:$rclone_artifact_sha256,
       server_image_digest:$server_image_digest, go_version:$go_version,
       rclone_version:$rclone_version}' >> "$ROWS"
 }
@@ -299,8 +439,8 @@ write_receipt() {
   local tmp="$RECEIPT_OUT.tmp.$$"
   jq -n \
     --arg outcome "$outcome" --arg reason "$reason" \
-    --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_SEAL_SHA" \
-    --arg snapshot_digest "$SNAP_DIGEST" \
+    --arg snapshot_path "$SNAP" --arg snapshot_sha256 "$SNAP_DIGEST" \
+    --arg snapshot_file_sha256 "$SNAP_FILE_SHA" \
     --arg rclone_path "$RCLONE_BIN" --arg rclone_sha "$RCLONE_ARTIFACT_SHA" \
     --arg rclone_version "$RCLONE_VERSION" --arg rclone_upstream "$RCLONE_UPSTREAM" \
     --arg image_tag "$IMAGE" --arg image_id "$IMAGE_ID" --arg go_version "$GO_VERSION" \
@@ -315,7 +455,7 @@ write_receipt() {
       "rclone copy td:verify/<scene> <private-download>")" \
     '{plan:"07-06", outcome:$outcome, reason:$reason,
       snapshot_path:$snapshot_path, snapshot_sha256:$snapshot_sha256,
-      snapshot_digest:$snapshot_digest,
+      snapshot_file_sha256:$snapshot_file_sha256,
       rclone_artifact_path:$rclone_path, rclone_artifact_sha256:$rclone_sha,
       rclone_version:$rclone_version, rclone_upstream_base:$rclone_upstream,
       server_image_tag:$image_tag, server_image_digest:$image_id,
@@ -415,13 +555,13 @@ if [[ -z "$SERVER_URL" ]]; then
   b6_bootstrap_api_key "$RUNTIME" "$PG_NAME" "$DB_USER" "$DB_NAME" "$SCHEMA" "$API_SECRET" \
     "b6-linux-mount" || fail "API key bootstrap failed"
 else
-  ROWS="$(mktemp "${TMPDIR:-/tmp}/b6-mount-scenes.XXXXXX")"
+  WORK="$PRIV/b6-$(b6_run_id)-mount-work"
+  mkdir -m 700 "$WORK"
+  ROWS="$WORK/scenes.jsonl"
   : > "$ROWS"
-  WORK="$(mktemp -d "${TMPDIR:-/tmp}/b6-mount-work.XXXXXX")"
-  chmod 700 "$WORK"
   mkdir -m 700 "$WORK/src" "$WORK/dl"
   BASE_URL="$SERVER_URL"
-  API_SECRET="$(head -c 4096 "$API_KEY_FILE" | tr -d '\n')"
+  API_SECRET="$(mount_read_api_key "$API_KEY_FILE")" || fail "api-key-multiline"
 fi
 BASE_URL="${BASE_URL%/}"
 
@@ -578,18 +718,20 @@ scene_rename() {
 scene_rename-open() {
   SCENE_OPERATION="open a 32 MiB file, rename it through a second process, hash the open read, rclone move, independent copy"
   local src="$WORK/src/rename-open.bin" dl="$WORK/dl/rename-open"
-  local hashfile="$WORK/rename-open.sha" errfile="$WORK/rename-open.err"
-  local opid st waited note=""
+  local readfile="$WORK/rename-open.bytes" errfile="$WORK/rename-open.err"
+  local opid st waited note="" verdict rc
   gen_det "$src" 33554432 || { SCENE_REASON="deterministic source generation failed"; return 1; }
   cp "$src" "$MOUNT/ro.bin" || { SCENE_REASON="could not write ro.bin"; return 1; }
   add_write "$(stat -c %s "$src")"
   limit_check || { SCENE_REASON="impact limit: $LIMIT_STATE"; return 1; }
-  : > "$hashfile"
+  : > "$readfile"
   : > "$errfile"
+  # Redirect the reader's bytes to a file; hashing a pipeline would take
+  # sha256sum's status and hide a failed `cat` (WR-08).
   (
     exec 3<"$MOUNT/ro.bin" || exit 1
     sleep 0.5
-    cat <&3 | sha256sum > "$hashfile"
+    cat <&3 > "$readfile"
   ) 2>"$errfile" &
   opid=$!
   sleep 0.2
@@ -610,18 +752,26 @@ scene_rename-open() {
   done
   wait "$opid"
   st=$?
-  local read_sha="" expected_src empty_sha
-  [[ -s "$hashfile" ]] && read_sha="$(cut -d' ' -f1 "$hashfile")"
+  local expected_src empty_sha
   expected_src="$(hash_of "$src")"
   empty_sha="$(printf '' | sha256sum | cut -d' ' -f1)"
-  if [[ "$st" -ne 0 && ( -z "$read_sha" || "$read_sha" == "$empty_sha" ) ]]; then
-    note="clean read failure (exit $st, no partial content)"
-  elif [[ "$read_sha" != "$expected_src" ]]; then
-    SCENE_REASON="open-file read returned wrong bytes (${read_sha:-none} != $expected_src)"
-    return 1
-  else
-    note="open read preserved the original bytes"
-  fi
+  verdict="$(mount_classify_read "$st" "$expected_src" "$empty_sha" "$errfile" "$readfile")" &&
+    rc=0 || rc=$?
+  case "$verdict" in
+    preserved) note="open read preserved the original bytes" ;;
+    clean-failure) note="clean read failure (exit $st, no content)" ;;
+    partial-failure) note="clean read failure (exit $st, partial content)" ;;
+    empty-read)
+      SCENE_REASON="open-file read returned no bytes with exit status 0"
+      return 1
+      ;;
+    *)
+      SCENE_REASON="open-file read returned wrong bytes (verdict $verdict, exit $st)"
+      return 1
+      ;;
+  esac
+  [[ "$rc" -eq 0 || "$rc" -eq 2 ]] ||
+    { SCENE_REASON="unexpected read classification $verdict"; return 1; }
   limit_check || { SCENE_REASON="impact limit: $LIMIT_STATE"; return 1; }
   account_transfer "$(stat -c %s "$src")"
   rc move "$MOUNT/ro-renamed.bin" "td:verify/rename-open/" >/dev/null 2>&1 ||
@@ -702,5 +852,5 @@ unmount_private
 limit_check || limit_abort
 write_receipt PASS ""
 log "PASS scenes=${#SCENES[@]} bytes_read=$BYTES_READ bytes_written=$BYTES_WRITTEN elapsed=$((SECONDS - START))s"
-printf 'LINUX-MOUNT PASS snapshot_sha256=%s rclone_artifact_sha256=%s server_image_digest=%s scenes=%s receipt=%s\n' \
-  "$SNAP_SEAL_SHA" "$RCLONE_ARTIFACT_SHA" "$IMAGE_ID" "${#SCENES[@]}" "$RECEIPT_OUT"
+printf 'LINUX-MOUNT PASS snapshot_sha256=%s snapshot_file_sha256=%s rclone_artifact_sha256=%s server_image_digest=%s scenes=%s receipt=%s\n' \
+  "$SNAP_DIGEST" "$SNAP_FILE_SHA" "$RCLONE_ARTIFACT_SHA" "$IMAGE_ID" "${#SCENES[@]}" "$RECEIPT_OUT"
