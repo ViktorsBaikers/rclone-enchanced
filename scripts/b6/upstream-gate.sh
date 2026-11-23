@@ -13,8 +13,15 @@
 #
 # Usage:
 #   ./scripts/b6/upstream-gate.sh --classify-only [--base <ref>]
-#   ./scripts/b6/upstream-gate.sh --full [--base <ref>]
+#   ./scripts/b6/upstream-gate.sh --full [--base <ref>] [--windows-evidence PATH]
+#   ./scripts/b6/upstream-gate.sh --full --accept-windows-not-run --reason TEXT
 #   ./scripts/b6/upstream-gate.sh --self-test
+#
+# --full fails closed unless Windows execution is proven by a successful
+# b6-windows run on this commit. Provide that proof with --windows-evidence
+# (flat JSON: conclusion, run_id, head_sha; or key=value lines: conclusion=,
+# run_id=, commit=), or record an explicit acceptance with
+# --accept-windows-not-run --reason "<non-empty>".
 #
 # --full writes a private receipt to ${B6_PRIVATE_DIR:-$HOME/.local/state/teldrive-b6}
 # unless B6_GATE_RECEIPT names one.
@@ -30,6 +37,9 @@ BASE=v1.76.0
 MODE=classify
 TMP_ROOT=
 RECEIPT=
+WINDOWS_EVIDENCE=
+ACCEPT_WINDOWS_NOT_RUN=false
+WINDOWS_REASON=
 
 # Published before the grouping policy. These two commits mix backend and
 # shared paths; rewriting them is prohibited by D-12/D-13.
@@ -41,11 +51,21 @@ LEGACY_MIXED_COMMITS=(
 usage() {
   printf '%s\n' \
     "usage: $0 [--classify-only|--full|--self-test] [--base <ref>]" \
+    "                    [--windows-evidence PATH]" \
+    "                    [--accept-windows-not-run --reason TEXT]" \
     "" \
     "  --classify-only  check commit path groups (default)" \
     "  --full           classify and run the contract gate" \
     "  --self-test      prove the classifier on synthetic histories" \
-    "  --base <ref>     upstream base commit or tag (default: v1.76.0)"
+    "  --base <ref>     upstream base commit or tag (default: v1.76.0)" \
+    "  --windows-evidence PATH" \
+    "                   sanitized Windows CI proof; --full fails closed without it" \
+    "                   flat JSON: {\"conclusion\":\"success\",\"run_id\":\"...\",\"head_sha\":\"...\"}" \
+    "                   or key=value lines: conclusion=success, run_id=..., commit=..." \
+    "                   a commit/head_sha must match HEAD when present" \
+    "  --accept-windows-not-run" \
+    "                   record Windows execution as NOT-RUN (accepted) instead" \
+    "  --reason TEXT    non-empty justification required by --accept-windows-not-run"
 }
 
 cleanup() {
@@ -78,6 +98,20 @@ while (($#)); do
       MODE=self-test
       shift
       ;;
+    --windows-evidence)
+      [[ $# -ge 2 ]] || { echo "--windows-evidence needs a value" >&2; exit 2; }
+      WINDOWS_EVIDENCE=$2
+      shift 2
+      ;;
+    --accept-windows-not-run)
+      ACCEPT_WINDOWS_NOT_RUN=true
+      shift
+      ;;
+    --reason)
+      [[ $# -ge 2 ]] || { echo "--reason needs a value" >&2; exit 2; }
+      WINDOWS_REASON=$2
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -89,6 +123,16 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ $ACCEPT_WINDOWS_NOT_RUN == true ]]; then
+  if [[ -z ${WINDOWS_REASON//[[:space:]]/} ]]; then
+    echo "--accept-windows-not-run requires a non-empty --reason" >&2
+    exit 2
+  fi
+elif [[ -n $WINDOWS_REASON ]]; then
+  echo "--reason requires --accept-windows-not-run" >&2
+  exit 2
+fi
 
 if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
   echo "not a Git repository: $REPO" >&2
@@ -152,7 +196,7 @@ is_legacy_mixed() {
 
 classify_range() {
   local base=$1
-  local commit full subject parents files path group
+  local commit full subject parents path group
   local backend shared docs junk unknown
   local failures=0 checked=0 merges=0 legacy=0
 
@@ -285,8 +329,31 @@ expect_gate() {
   return 1
 }
 
+expect_windows_gate() {
+  local name=$1 expected=$2 want=${3:-} out status ok=true
+  set +e
+  out=$(windows_gate 2>&1)
+  status=$?
+  set -e
+  if [[ $expected == pass ]]; then
+    [[ $status -eq 0 ]] || ok=false
+  else
+    [[ $status -ne 0 ]] || ok=false
+  fi
+  if [[ -n $want && $out != *"$want"* ]]; then
+    ok=false
+  fi
+  if [[ $ok == true ]]; then
+    say "SELF-TEST PASS $name"
+    return 0
+  fi
+  say "SELF-TEST FAIL $name (expected $expected, exit $status)"
+  printf '%s\n' "$out" | sed 's/^/  /'
+  return 1
+}
+
 self_test() {
-  local failures=0 dir
+  local failures=0 dir head_sha status
 
   TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/b6-upstream-gate.XXXXXX")
 
@@ -318,11 +385,55 @@ self_test() {
   fixture_commit "$dir" "unknown path" unknown/fixture.go
   expect_gate "$dir" fail "unknown-path" || failures=$((failures + 1))
 
+  head_sha=$(git -C "$REPO" rev-parse HEAD)
+
+  WINDOWS_EVIDENCE=
+  ACCEPT_WINDOWS_NOT_RUN=false
+  WINDOWS_REASON=
+  expect_windows_gate "windows-missing-evidence" fail || failures=$((failures + 1))
+
+  printf '{"conclusion":"failure","run_id":"100","head_sha":"%s"}\n' "$head_sha" >"$TMP_ROOT/windows.json"
+  WINDOWS_EVIDENCE="$TMP_ROOT/windows.json"
+  expect_windows_gate "windows-failed-conclusion" fail || failures=$((failures + 1))
+
+  printf '{"conclusion":"success","run_id":"101","head_sha":"%s"}\n' "$head_sha" >"$TMP_ROOT/windows.json"
+  expect_windows_gate "windows-success" pass || failures=$((failures + 1))
+
+  printf 'conclusion=failure\nrun_id=102\n' >"$TMP_ROOT/windows.txt"
+  WINDOWS_EVIDENCE="$TMP_ROOT/windows.txt"
+  expect_windows_gate "windows-text-failed-conclusion" fail || failures=$((failures + 1))
+
+  printf 'conclusion=success\nrun_id=103\ncommit=%s\n' "$head_sha" >"$TMP_ROOT/windows.txt"
+  expect_windows_gate "windows-text-success" pass || failures=$((failures + 1))
+
+  printf '{"conclusion":"success","run_id":"104","head_sha":"%040d"}\n' 0 >"$TMP_ROOT/windows.json"
+  WINDOWS_EVIDENCE="$TMP_ROOT/windows.json"
+  expect_windows_gate "windows-wrong-commit" fail || failures=$((failures + 1))
+
+  WINDOWS_EVIDENCE=
+  ACCEPT_WINDOWS_NOT_RUN=true
+  WINDOWS_REASON="no Windows runner in this environment"
+  expect_windows_gate "windows-accepted-not-run" pass "NOT-RUN (accepted)" || failures=$((failures + 1))
+
+  set +e
+  "$SELF" --accept-windows-not-run --reason "" --classify-only >/dev/null 2>&1
+  status=$?
+  set -e
+  if ((status != 0)); then
+    say "SELF-TEST PASS windows-empty-reason (rejected as expected)"
+  else
+    say "SELF-TEST FAIL windows-empty-reason (empty reason accepted)"
+    failures=$((failures + 1))
+  fi
+
+  ACCEPT_WINDOWS_NOT_RUN=false
+  WINDOWS_REASON=
+
   if ((failures > 0)); then
     say "self-test summary: failures=$failures"
     return 1
   fi
-  say "self-test summary: 7 fixtures passed"
+  say "self-test summary: 7 classifier fixtures and 7 windows-execution cases passed"
   return 0
 }
 
@@ -414,6 +525,58 @@ step_windows_test_compile() {
   say "  compiled packages: $count"
 }
 
+# Read one field from a sanitized evidence file. Flat JSON uses quotes; txt uses
+# key=value lines and an optional commit= key. Unknown keys yield an empty value.
+windows_evidence_field() {
+  local file=$1 key=$2
+  if [[ "$(head -c 1 "$file")" == "{" ]]; then
+    tr '\n' ' ' <"$file" |
+      sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" |
+      head -n 1
+    return
+  fi
+  sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" |
+    head -n 1 | tr -d '\r'
+}
+
+# Windows execution proof is a successful b6-windows CI run on this commit.
+# Missing or failed evidence fails the gate unless the operator recorded an
+# explicit acceptance with a non-empty reason.
+windows_gate() {
+  if [[ $ACCEPT_WINDOWS_NOT_RUN == true ]]; then
+    say "RESULT[windows-execution]: NOT-RUN (accepted)"
+    say "windows-execution acceptance: $WINDOWS_REASON"
+    return 0
+  fi
+  if [[ -z $WINDOWS_EVIDENCE ]]; then
+    say "FAIL windows-execution: no evidence (pass --windows-evidence PATH or --accept-windows-not-run --reason TEXT)"
+    return 1
+  fi
+  if [[ ! -f $WINDOWS_EVIDENCE ]]; then
+    say "FAIL windows-execution: evidence file not found: $WINDOWS_EVIDENCE"
+    return 1
+  fi
+
+  local conclusion run_id commit head
+  conclusion=$(windows_evidence_field "$WINDOWS_EVIDENCE" conclusion)
+  run_id=$(windows_evidence_field "$WINDOWS_EVIDENCE" run_id)
+  commit=$(windows_evidence_field "$WINDOWS_EVIDENCE" head_sha)
+  [[ -n $commit ]] || commit=$(windows_evidence_field "$WINDOWS_EVIDENCE" commit)
+  head=$(git -C "$REPO" rev-parse HEAD)
+  [[ -n $run_id ]] || run_id=unknown
+
+  if [[ -n $commit && $commit != "$head" ]]; then
+    say "FAIL windows-execution: evidence commit $commit does not match HEAD $head"
+    return 1
+  fi
+  say "RESULT[windows-execution]: ${conclusion:-missing} run=$run_id commit=${commit:-unbound}"
+  if [[ $conclusion != success ]]; then
+    say "FAIL windows-execution: conclusion '${conclusion:-missing}' is not success"
+    return 1
+  fi
+  return 0
+}
+
 run_full() {
   local failures=0
   mkdir -p "${TMPDIR:-/tmp}"
@@ -435,7 +598,7 @@ run_full() {
   run_step windows-test-compile "GOOS=windows go test -c for the b6-windows package set" step_windows_test_compile || failures=$((failures + 1))
 
   say "COMMAND[windows-execution]: .github/workflows/b6-windows.yml on windows-latest"
-  say "RESULT[windows-execution]: NOT-RUN (no local Windows host; a successful b6-windows Actions run on this commit is the only execution proof)"
+  windows_gate || failures=$((failures + 1))
 
   if ((failures > 0)); then
     say "full summary: FAIL failures=$failures receipt=$RECEIPT"
