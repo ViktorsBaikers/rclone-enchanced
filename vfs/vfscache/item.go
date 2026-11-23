@@ -409,11 +409,11 @@ func (item *Item) HeldReason() string {
 	return item.guardHeld
 }
 
-// _heldErrorLocked records a definitive hold and returns a queue disposition
+// _holdLocked records a definitive hold and returns a queue disposition
 // which can never fall into generic retry or success.
 //
 // Call with item.mu held.
-func (item *Item) _heldErrorLocked(reason string) error {
+func (item *Item) _holdLocked(reason string) error {
 	if reason == "" {
 		reason = "vfs cache: guarded write is held"
 	}
@@ -602,21 +602,6 @@ func guardedNamespaceEpoch(f fs.Fs) uint64 {
 	return 0
 }
 
-// _holdGuard records a definitive non-runnable reason and persists it. Call
-// with item.mu held.
-func (item *Item) _holdGuard(reason string) error {
-	item.guardHeld = reason
-	item.info.GuardHold = reason
-	if item.guardJournal != nil {
-		item.guardJournal.Reason = reason
-		_ = item._saveGuardLocked()
-	}
-	if err := item._save(); err != nil {
-		fs.Errorf(item.name, "vfs cache: failed to persist guarded hold: %v", err)
-	}
-	return &writeback.HeldError{Reason: reason}
-}
-
 // _proveGuardedBytes re-hashes the complete local plaintext against the digest
 // captured before the send. Bytes that cannot be proven never reconcile.
 //
@@ -667,7 +652,7 @@ func (item *Item) reconcileGuard(ctx context.Context) (bool, error) {
 		if attempt+1 >= attempts {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: namespace changed during reconciliation")
+			return false, item._holdLocked("vfs cache: namespace changed during reconciliation")
 		}
 	}
 }
@@ -691,7 +676,7 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 		if item.guardHeld != "" {
 			return false, &writeback.HeldError{Reason: item.guardHeld}
 		}
-		return false, item._holdGuard("vfs cache: uncertain guarded generation")
+		return false, item._holdLocked("vfs cache: uncertain guarded generation")
 	}
 
 	item.mu.Lock()
@@ -699,7 +684,7 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 	if proofErr != nil {
 		if errors.Is(proofErr, fs.ErrGuardedConflict) || errors.Is(proofErr, fs.ErrGuardedProofUnavailable) ||
 			errors.Is(proofErr, fs.ErrGuardedUnsupported) {
-			heldErr := item._holdGuard("vfs cache: local guarded bytes are not proven")
+			heldErr := item._holdLocked("vfs cache: local guarded bytes are not proven")
 			item.mu.Unlock()
 			return false, heldErr
 		}
@@ -713,13 +698,13 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 	if !ok {
 		item.mu.Lock()
 		defer item.mu.Unlock()
-		return false, item._holdGuard("vfs cache: guarded alias cannot be resolved")
+		return false, item._holdLocked("vfs cache: guarded alias cannot be resolved")
 	}
 	alias, err := resolver.ResolveGuardedAlias(ctx, journal.Intent)
 	if err != nil {
 		item.mu.Lock()
 		defer item.mu.Unlock()
-		return false, item._holdGuard("vfs cache: guarded destination is not current")
+		return false, item._holdLocked("vfs cache: guarded destination is not current")
 	}
 
 	var receipt fs.GuardedCommit
@@ -731,20 +716,20 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 			!strings.EqualFold(receipt.Hash.Value, journal.PlainHash.Value) {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: durable receipt does not match the local proof")
+			return false, item._holdLocked("vfs cache: durable receipt does not match the local proof")
 		}
 		object, err = item.c.fremote.NewObject(ctx, alias)
 		if err != nil {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: guarded result is not readable")
+			return false, item._holdLocked("vfs cache: guarded result is not readable")
 		}
 	} else {
 		reconciler, ok := item.c.fremote.(fs.GuardedReceiptFs)
 		if !ok {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: guarded receipt cannot be reconciled")
+			return false, item._holdLocked("vfs cache: guarded receipt cannot be reconciled")
 		}
 		proof, ok := item.GuardedReceiptProof()
 		if !ok {
@@ -753,14 +738,14 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 			if item.guardHeld != "" {
 				return false, &writeback.HeldError{Reason: item.guardHeld}
 			}
-			return false, item._holdGuard("vfs cache: guarded attempt is not proven")
+			return false, item._holdLocked("vfs cache: guarded attempt is not proven")
 		}
 		proof.NamespaceEpoch = epoch
 		result, reconcileErr := reconciler.ReconcileGuardedReceipt(ctx, proof)
 		if reconcileErr != nil {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: guarded result could not be reconciled")
+			return false, item._holdLocked("vfs cache: guarded result could not be reconciled")
 		}
 		if result.ResultID == "" || result.Size != journal.PlainSize ||
 			result.Hash.Algorithm != journal.PlainHash.Algorithm ||
@@ -768,7 +753,7 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 			(result.NamespaceEpoch != 0 && result.NamespaceEpoch != epoch) {
 			item.mu.Lock()
 			defer item.mu.Unlock()
-			return false, item._holdGuard("vfs cache: reconciled result does not match the local proof")
+			return false, item._holdLocked("vfs cache: reconciled result does not match the local proof")
 		}
 		object = result.Object
 		receipt = fs.GuardedCommit{
@@ -801,7 +786,7 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 	if err := item.c.AdoptAlias(item, alias); err != nil {
 		item.mu.Lock()
 		defer item.mu.Unlock()
-		return false, item._holdGuard("vfs cache: guarded alias is occupied")
+		return false, item._holdLocked("vfs cache: guarded alias is occupied")
 	}
 
 	item.mu.Lock()
@@ -819,7 +804,7 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 	item.info.Dirty = false
 	if err := item._save(); err != nil {
 		item.info.Dirty = true
-		return false, item._holdGuard("vfs cache: reconciled clean metadata save failed")
+		return false, item._holdLocked("vfs cache: reconciled clean metadata save failed")
 	}
 	return true, nil
 }
@@ -865,19 +850,19 @@ func guardedHoldReason(err error) string {
 func (item *Item) _recordGuardedReceipt(o fs.Object, generation string) error {
 	published, ok := o.(fs.GuardedPublishedObject)
 	if !ok {
-		return item._heldErrorLocked("vfs cache: guarded completion has no exact result")
+		return item._holdLocked("vfs cache: guarded completion has no exact result")
 	}
 	result, ok := published.GuardedWriteResult()
 	if !ok || result.ResultID == "" {
-		return item._heldErrorLocked("vfs cache: guarded completion has no exact result")
+		return item._holdLocked("vfs cache: guarded completion has no exact result")
 	}
 	journal := item.guardJournal
 	if journal == nil || journal.Generation != generation || journal.PlainHash == nil {
-		return item._heldErrorLocked("vfs cache: guarded journal does not match the completed generation")
+		return item._holdLocked("vfs cache: guarded journal does not match the completed generation")
 	}
 	if result.Size != journal.PlainSize || result.Hash.Algorithm != journal.PlainHash.Algorithm ||
 		!strings.EqualFold(result.Hash.Value, journal.PlainHash.Value) {
-		return item._heldErrorLocked("vfs cache: guarded result does not match the local proof")
+		return item._holdLocked("vfs cache: guarded result does not match the local proof")
 	}
 	journal.Receipt = &fs.GuardedCommit{
 		AdmissionKey: journal.AdmissionKey, SessionID: journal.SessionID, Generation: generation,
@@ -1433,13 +1418,13 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	}
 	if item.guardActive {
 		if item.mutationUncertain || item.guardHeld != "" {
-			return item._heldErrorLocked(item.guardHeld)
+			return item._holdLocked(item.guardHeld)
 		}
 		if item.guardJournal == nil || item.guardJournal.Generation != generation {
-			return item._heldErrorLocked("vfs cache: guarded journal is unavailable")
+			return item._holdLocked("vfs cache: guarded journal is unavailable")
 		}
 		if item.info.MutationMarker != "" {
-			return item._heldErrorLocked("vfs cache: local mutation is unresolved")
+			return item._holdLocked("vfs cache: local mutation is unresolved")
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -1473,7 +1458,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		if proofErr != nil {
 			if errors.Is(proofErr, fs.ErrGuardedConflict) || errors.Is(proofErr, fs.ErrGuardedHold) ||
 				errors.Is(proofErr, fs.ErrGuardedProofUnavailable) {
-				return item._heldErrorLocked(guardedHoldReason(proofErr))
+				return item._holdLocked(guardedHoldReason(proofErr))
 			}
 			return proofErr
 		}
@@ -1493,7 +1478,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		item.guardJournal = &journal
 		_ = item._saveGuardLocked()
 		if saveErr := item._save(); saveErr != nil {
-			return item._heldErrorLocked("vfs cache: guarded proof save failed")
+			return item._holdLocked("vfs cache: guarded proof save failed")
 		}
 		ctx = fs.WithGuardedWriteIntent(ctx, journal.Intent)
 	}
@@ -1513,7 +1498,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		item._syncGuardAttemptLocked()
 		if item.guardActive && (errors.Is(err, fs.ErrGuardedConflict) || errors.Is(err, fs.ErrGuardedHold) ||
 			errors.Is(err, fs.ErrGuardedProofUnavailable)) {
-			return item._heldErrorLocked(guardedHoldReason(err))
+			return item._holdLocked(guardedHoldReason(err))
 		}
 		return fmt.Errorf("vfs cache: failed to transfer file from cache to remote: %w", err)
 	}
@@ -1526,12 +1511,12 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		// A receipt may only become a clean alias in the namespace it was
 		// completing in, and only at the authoritative destination.
 		if guardedNamespaceEpoch(item.c.fremote) != epoch {
-			return item._heldErrorLocked("vfs cache: namespace changed before receipt installation")
+			return item._holdLocked("vfs cache: namespace changed before receipt installation")
 		}
 		intent := item.guardJournal.Intent
 		resolver, ok := item.c.fremote.(fs.GuardedAliasResolver)
 		if !ok {
-			return item._heldErrorLocked("vfs cache: guarded alias cannot be resolved")
+			return item._holdLocked("vfs cache: guarded alias cannot be resolved")
 		}
 		item.mu.Unlock()
 		alias, aliasErr := resolver.ResolveGuardedAlias(ctx, intent)
@@ -1542,10 +1527,10 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 		}
 		item.mu.Lock()
 		if aliasErr != nil {
-			return item._heldErrorLocked("vfs cache: guarded result could not be placed")
+			return item._holdLocked("vfs cache: guarded result could not be placed")
 		}
 		if guardedNamespaceEpoch(item.c.fremote) != epoch {
-			return item._heldErrorLocked("vfs cache: namespace changed before receipt installation")
+			return item._holdLocked("vfs cache: namespace changed before receipt installation")
 		}
 	}
 
@@ -1556,7 +1541,7 @@ func (item *Item) _store(ctx context.Context, storeFn StoreFn) (err error) {
 	item.info.Dirty = true
 	if err != nil {
 		if item.guardActive {
-			return item._heldErrorLocked("vfs cache: completed receipt save failed")
+			return item._holdLocked("vfs cache: completed receipt save failed")
 		}
 		return fmt.Errorf("vfs cache: failed to write clean metadata: %w", err)
 	}
