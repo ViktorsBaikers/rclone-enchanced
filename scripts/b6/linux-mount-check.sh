@@ -159,6 +159,7 @@ if [[ ! -e /dev/fuse ]]; then
       server_image_digest:$image_id, scenes:[], impact_limits:{seconds:180,bytes:8589934592},
       limit_state:"none", production_touched:false}' > "$RECEIPT_OUT"
   chmod 600 "$RECEIPT_OUT"
+  RECEIPT_WRITTEN=true
   log "NOT-RUN: missing /dev/fuse"
   exit 2
 fi
@@ -173,6 +174,7 @@ if ! command -v fusermount3 >/dev/null 2>&1; then
       server_image_digest:$image_id, scenes:[], impact_limits:{seconds:180,bytes:8589934592},
       limit_state:"none", production_touched:false}' > "$RECEIPT_OUT"
   chmod 600 "$RECEIPT_OUT"
+  RECEIPT_WRITTEN=true
   log "NOT-RUN: missing fusermount3"
   exit 2
 fi
@@ -198,6 +200,11 @@ RCLONE_VERSION="$("$RCLONE_BIN" version | head -n 1)"
 RCLONE_UPSTREAM="$(jq -r '.metadata.upstream_base // empty' "$BUILD_RECEIPT")"
 "$RCLONE_BIN" version | grep -qx -- "- build/snapshot: $SNAP_DIGEST" ||
   fail "rclone artifact does not report the sealed snapshot digest"
+
+# The impact clock starts after every precondition and the optional
+# reproducible build, so a cold build cannot consume the measurement budget.
+START=$SECONDS
+RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # --- helpers ---------------------------------------------------------------
 hash_of() { sha256sum -- "$1" | cut -d' ' -f1; }

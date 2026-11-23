@@ -411,6 +411,54 @@ func TestB3DirtyCachedHandle(t *testing.T) {
 	require.Equal(t, "XX23456789abcdef", string(mustReadFile(t, c.toOSPath(item.name))))
 }
 
+// TestB3ReconcileCorruptHeldDoesNotDeadlock proves a reloaded held generation
+// whose local bytes no longer match the journal proof is re-held without
+// leaving item.mu locked; ReconcileGuarded would otherwise hang forever.
+func TestB3ReconcileCorruptHeldDoesNotDeadlock(t *testing.T) {
+	fixture := new(b3GuardFixture)
+	endpoint := b3GuardServer(t, fixture)
+	root := t.TempDir()
+	_, c := b3GuardCache(t, root, endpoint)
+	item, _ := c.get("pending.txt")
+	require.NoError(t, item.Open(nil))
+	const payload = "independent pending cache bytes"
+	_, err := item.WriteAt([]byte(payload), 0)
+	require.NoError(t, err)
+	require.NoError(t, item.Close(nil))
+
+	b3GuardForce(t, c, "pending.txt")
+	require.Eventually(t, func() bool { return item.HeldReason() != "" }, 5*time.Second, time.Millisecond)
+	item.mu.Lock()
+	journal := item.guardJournal
+	item.mu.Unlock()
+	require.NotNil(t, journal)
+	require.NotNil(t, journal.PlainHash, "the failed attempt must persist its local proof")
+
+	// Corrupt one byte without changing the size the journal proved.
+	backing := c.toOSPath("pending.txt")
+	body := mustReadFile(t, backing)
+	body[0] ^= 0xff
+	require.NoError(t, os.WriteFile(backing, body, 0o600))
+
+	reloaded, err := New(context.Background(), c.fremote, c.opt, func(string, int64, bool) error { return nil })
+	require.NoError(t, err)
+	loaded, found := reloaded.get("pending.txt")
+	require.True(t, found)
+
+	done := make(chan struct{})
+	go func() {
+		reloaded.ReconcileGuarded(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReconcileGuarded deadlocked on a corrupt held generation")
+	}
+	require.NotEmpty(t, loaded.HeldReason())
+	require.True(t, loaded.IsDirty())
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	body, err := os.ReadFile(path)

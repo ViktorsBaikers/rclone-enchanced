@@ -699,7 +699,9 @@ func (item *Item) reconcileGuardAttempt(ctx context.Context) (bool, error) {
 	if proofErr != nil {
 		if errors.Is(proofErr, fs.ErrGuardedConflict) || errors.Is(proofErr, fs.ErrGuardedProofUnavailable) ||
 			errors.Is(proofErr, fs.ErrGuardedUnsupported) {
-			return false, item._holdGuard("vfs cache: local guarded bytes are not proven")
+			heldErr := item._holdGuard("vfs cache: local guarded bytes are not proven")
+			item.mu.Unlock()
+			return false, heldErr
 		}
 		item.mu.Unlock()
 		return false, proofErr
