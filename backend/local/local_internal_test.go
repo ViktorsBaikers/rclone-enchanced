@@ -59,10 +59,11 @@ func TestUpdatingCheck(t *testing.T) {
 	hash, err := hash.NewMultiHasherTypes(hash.Supported())
 	require.NoError(t, err)
 	in := localOpenFile{
-		o:    o,
-		in:   wrappedFd,
-		hash: hash,
-		fd:   fd,
+		o:     o,
+		in:    wrappedFd,
+		hash:  hash,
+		fd:    fd,
+		start: fi,
 	}
 
 	buf := make([]byte, 1)
@@ -937,6 +938,171 @@ func TestHashWithTypeNone(t *testing.T) {
 	h, err := o.Hash(ctx, hash.None)
 	require.Empty(t, h)
 	require.NoError(t, err)
+}
+
+func TestB1LocalHashReadIdentity(t *testing.T) {
+	ctx := context.Background()
+	newSource := func(t *testing.T) (*Object, string) {
+		t.Helper()
+		root := t.TempDir()
+		name := filepath.Join(root, "source")
+		require.NoError(t, os.WriteFile(name, []byte("content"), 0600))
+		f, err := NewFs(ctx, "local", root, configmap.Simple{})
+		require.NoError(t, err)
+		src, err := f.NewObject(ctx, "source")
+		require.NoError(t, err)
+		return src.(*Object), name
+	}
+	openHashed := func(t *testing.T, o *Object, options ...fs.OpenOption) io.ReadCloser {
+		t.Helper()
+		options = append(options, &fs.HashesOption{Hashes: hash.NewHashSet(hash.MD5)})
+		in, err := o.Open(ctx, options...)
+		require.NoError(t, err)
+		return in
+	}
+	for _, change := range []string{"mtime", "size", "identity"} {
+		t.Run("old-close-after-refresh/"+change, func(t *testing.T) {
+			o, name := newSource(t)
+			in := openHashed(t, o)
+			_, err := io.Copy(io.Discard, in)
+			require.NoError(t, err)
+			when := o.ModTime(ctx)
+			switch change {
+			case "mtime":
+				require.NoError(t, os.WriteFile(name, []byte("CONTENT"), 0600))
+				require.NoError(t, os.Chtimes(name, when.Add(time.Hour), when.Add(time.Hour)))
+			case "size":
+				require.NoError(t, os.WriteFile(name, []byte("new content"), 0600))
+			case "identity":
+				replacement := name + ".new"
+				require.NoError(t, os.WriteFile(replacement, []byte("CONTENT"), 0600))
+				require.NoError(t, os.Chtimes(replacement, when, when))
+				require.NoError(t, os.Rename(replacement, name))
+			}
+			later, err := o.Open(ctx)
+			require.NoError(t, err)
+			require.NoError(t, later.Close())
+			require.NoError(t, in.Close())
+			assert.Empty(t, o.hashes, "an older read must not install hashes after metadata refresh")
+			got, err := o.Hash(ctx, hash.MD5)
+			require.NoError(t, err)
+			data, err := os.ReadFile(name)
+			require.NoError(t, err)
+			want, err := hash.StreamTypes(bytes.NewReader(data), hash.NewHashSet(hash.MD5))
+			require.NoError(t, err)
+			assert.Equal(t, want[hash.MD5], got)
+		})
+	}
+	t.Run("read-keeps-start-metadata", func(t *testing.T) {
+		o, name := newSource(t)
+		in := openHashed(t, o)
+		require.NoError(t, os.WriteFile(name, []byte("new content"), 0600))
+		later, err := o.Open(ctx)
+		require.NoError(t, err)
+		require.NoError(t, later.Close())
+		_, err = in.Read(make([]byte, 1))
+		require.ErrorContains(t, err, "source file is being updated")
+		require.NoError(t, in.Close())
+		assert.Empty(t, o.hashes)
+	})
+	for _, change := range []string{"size", "mtime", "identity"} {
+		t.Run("observed-change-invalidates-direct-hash/"+change, func(t *testing.T) {
+			o, name := newSource(t)
+			_, err := o.Hash(ctx, hash.MD5)
+			require.NoError(t, err)
+			require.NotEmpty(t, o.hashes)
+			when := o.ModTime(ctx)
+			switch change {
+			case "size":
+				require.NoError(t, os.WriteFile(name, []byte("new content"), 0600))
+			case "mtime":
+				require.NoError(t, os.WriteFile(name, []byte("CONTENT"), 0600))
+				require.NoError(t, os.Chtimes(name, when.Add(time.Hour), when.Add(time.Hour)))
+			case "identity":
+				require.NoError(t, os.WriteFile(name+".new", []byte("CONTENT"), 0600))
+				require.NoError(t, os.Chtimes(name+".new", when, when))
+				require.NoError(t, os.Rename(name+".new", name))
+			}
+			later, err := o.Open(ctx)
+			require.NoError(t, err)
+			require.NoError(t, later.Close())
+			assert.Empty(t, o.hashes)
+			got, err := o.Hash(ctx, hash.MD5)
+			require.NoError(t, err)
+			if change != "size" {
+				assert.Equal(t, "45685e95985e20822fb2538a522a5ccf", got)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name    string
+		options []fs.OpenOption
+		cache   bool
+	}{
+		{name: "full", cache: true},
+		{name: "offset", options: []fs.OpenOption{&fs.SeekOption{Offset: 1}}},
+		{name: "range", options: []fs.OpenOption{&fs.RangeOption{Start: 0, End: 2}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o, _ := newSource(t)
+			in := openHashed(t, o, test.options...)
+			_, err := io.Copy(io.Discard, in)
+			require.NoError(t, err)
+			require.NoError(t, in.Close())
+			assert.Equal(t, test.cache, len(o.hashes) != 0)
+			got, err := o.Hash(ctx, hash.MD5)
+			require.NoError(t, err)
+			assert.Equal(t, "9a0364b9e99bb480dd25e1f0284c8555", got)
+		})
+	}
+	t.Run("direct-hash-keeps-other-verified-algorithms", func(t *testing.T) {
+		o, _ := newSource(t)
+		md5, err := o.Hash(ctx, hash.MD5)
+		require.NoError(t, err)
+		_, err = o.Hash(ctx, hash.SHA1)
+		require.NoError(t, err)
+		assert.Equal(t, md5, o.hashes[hash.MD5])
+		assert.Len(t, o.hashes, 2)
+	})
+	t.Run("no-hasher", func(t *testing.T) {
+		o, _ := newSource(t)
+		in, err := o.Open(ctx)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, in)
+		require.NoError(t, err)
+		require.NoError(t, in.Close())
+		assert.Empty(t, o.hashes)
+	})
+	t.Run("no-check-updated-does-not-cache-changed-read", func(t *testing.T) {
+		o, name := newSource(t)
+		o.fs.opt.NoCheckUpdated = true
+		in := openHashed(t, o)
+		require.NoError(t, os.WriteFile(name, []byte("new content"), 0600))
+		data, err := io.ReadAll(in)
+		require.NoError(t, err)
+		assert.Len(t, data, len("content"))
+		require.NoError(t, in.Close())
+		assert.Empty(t, o.hashes)
+	})
+	t.Run("translated-link", func(t *testing.T) {
+		skipIfNoSymlinks(t)
+		o, name := newSource(t)
+		linksMode(o.fs)
+		require.NoError(t, os.Symlink("source", name+".link"))
+		src, err := o.fs.NewObject(ctx, "source.link"+fs.LinkSuffix)
+		require.NoError(t, err)
+		in := openHashed(t, src.(*Object))
+		data, err := io.ReadAll(in)
+		require.NoError(t, err)
+		require.NoError(t, in.Close())
+		assert.Equal(t, "source", string(data))
+		assert.Empty(t, src.(*Object).hashes)
+		got, err := src.Hash(ctx, hash.MD5)
+		require.NoError(t, err)
+		want, err := hash.StreamTypes(bytes.NewBufferString("source"), hash.NewHashSet(hash.MD5))
+		require.NoError(t, err)
+		assert.Equal(t, want[hash.MD5], got)
+	})
 }
 
 // Test hashes on updating an object

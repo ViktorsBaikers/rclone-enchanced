@@ -1,0 +1,111 @@
+---
+# B6 Windows proof job.
+#
+# Scope: Windows/amd64 build, version output, `go vet`, targeted package tests,
+# and sanitized evidence. A green run proves compilation and package tests only.
+# Native mount via WinFsp, drive letters/path behavior, Unicode/case/rename/
+# open-file/large-file mount semantics, the service-account context, Docker
+# Desktop with a Linux TelDrive container, and PostgreSQL on Windows are NOT-RUN.
+# See docs/research/teldrive-rclone/b6-windows-not-run.md.
+#
+# Triggers: manual dispatch and the disposable `b6-windows-proof` test branch.
+# Never add pull-request, tag, release, package-write, or secret-bearing steps.
+
+name: b6-windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - b6-windows-proof
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b6-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows amd64 build and targeted tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          check-latest: false
+          cache: false
+
+      # The plan reserves the trigger block to two events, so no dispatch input
+      # can be declared. The optional snapshot marker comes from a repository
+      # variable and falls back to an honest `unknown-ci`. A sealed digest is
+      # never faked or inferred.
+      - name: Resolve build metadata
+        env:
+          SNAPSHOT_INPUT: ${{ vars.B6_BUILD_SNAPSHOT }}
+        run: |
+          snapshot="${SNAPSHOT_INPUT:-unknown-ci}"
+          if [ "$snapshot" != "unknown-ci" ] &&
+             ! printf '%s' "$snapshot" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "snapshot must be unknown-ci or a 64-character lowercase SHA-256" >&2
+            exit 1
+          fi
+          echo "B6_SNAPSHOT=${snapshot}" >> "$GITHUB_ENV"
+          echo "B6_BUILD_DATE=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build Windows amd64 binary
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          export CGO_ENABLED=0
+          go build -trimpath -buildvcs=false \
+            -ldflags "-X github.com/rclone/rclone/fs.Version=v0.1.0-enchanced -X github.com/rclone/rclone/fs.BuildCommit=${COMMIT} -X github.com/rclone/rclone/fs.BuildDate=${B6_BUILD_DATE} -X github.com/rclone/rclone/fs.BuildSnapshot=${B6_SNAPSHOT} -X github.com/rclone/rclone/fs.BuildDirty=false" \
+            -o rclone.exe .
+          sha256sum rclone.exe | tee rclone.exe.sha256
+
+      - name: Verify version output
+        run: |
+          ./rclone.exe version | tee version.txt
+          grep -q 'v0.1.0-enchanced' version.txt
+          grep -q 'build/commit:' version.txt
+          grep -q 'build/date:' version.txt
+          grep -q "build/snapshot: ${B6_SNAPSHOT}" version.txt
+          grep -q 'build/dirty: false' version.txt
+
+      - name: Vet Windows build
+        run: |
+          export GOOS=windows GOARCH=amd64 CGO_ENABLED=0
+          go vet ./backend/teldrive/... ./fs/chunkedreader/... ./fs/operations/... ./lib/pool/... ./fs/rc/... 2>&1 | tee vet.log
+
+      - name: Run targeted tests
+        env:
+          RCLONE_CONFIG: 'C:\nonexistent\rclone.conf'
+        run: |
+          export GOOS=windows GOARCH=amd64 CGO_ENABLED=0
+          go test -count=1 ./backend/teldrive/... ./backend/teldrive/tdhash/... \
+            ./fs/chunkedreader/... ./fs/operations/... ./fs/rc/jobs ./fs/rc/rcserver \
+            ./lib/pool/... ./lib/dircache/... ./vfs/... ./backend/local/... 2>&1 | tee test.log
+
+      - name: Upload sanitized evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: b6-windows-evidence
+          path: |
+            version.txt
+            rclone.exe.sha256
+            vet.log
+            test.log
+          if-no-files-found: ignore
+          retention-days: 7

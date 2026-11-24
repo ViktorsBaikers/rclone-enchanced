@@ -20,9 +20,11 @@ import (
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockdir"
+	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -845,4 +847,92 @@ func TestMatchListingsNoProcessDstOnly(t *testing.T) {
 			assert.True(t, cancelled, "dstCancel should have been called")
 		})
 	}
+}
+
+// failingLookupFs fails NewObject for the named remotes and delegates the rest.
+type failingLookupFs struct {
+	fs.Fs
+	errs map[string]error
+}
+
+func (f *failingLookupFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if err, ok := f.errs[remote]; ok {
+		return nil, err
+	}
+	return f.Fs.NewObject(ctx, remote)
+}
+
+// noopMarcher ignores every entry.
+type noopMarcher struct{}
+
+func (noopMarcher) SrcOnly(fs.DirEntry) bool                             { return false }
+func (noopMarcher) DstOnly(fs.DirEntry) bool                             { return false }
+func (noopMarcher) Match(context.Context, fs.DirEntry, fs.DirEntry) bool { return false }
+
+// TestMarchJoinsLookupErrors proves no destination error masks another.
+func TestMarchJoinsLookupErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lookupA := errors.New("lookup failure a")
+	lookupB := errors.New("lookup failure b")
+	listingErr := errors.New("destination listing failure")
+
+	// Both a listing error and every lookup error survive the join.
+	err := joinDestinationErrors(listingErr, []error{lookupA, lookupB})
+	require.ErrorIs(t, err, listingErr)
+	require.ErrorIs(t, err, lookupA)
+	require.ErrorIs(t, err, lookupB)
+
+	newMarch := func(dst fs.Fs) *March {
+		srcFs, err := mockfs.NewFs(ctx, "mock", "", nil)
+		require.NoError(t, err)
+		return &March{
+			Ctx:          ctx,
+			Fsrc:         srcFs,
+			Fdst:         dst,
+			NoTraverse:   true,
+			Callback:     noopMarcher{},
+			newObjectSem: semaphore.NewWeighted(2),
+			srcListDir: func(_ context.Context, _ string, callback fs.ListRCallback) error {
+				return callback(fs.DirEntries{mockobject.Object("a"), mockobject.Object("b")})
+			},
+			dstListDir: func(_ context.Context, _ string, _ fs.ListRCallback) error {
+				return listingErr
+			},
+		}
+	}
+
+	t.Run("every lookup error survives", func(t *testing.T) {
+		dstFs, err := mockfs.NewFs(ctx, "mock", "", nil)
+		require.NoError(t, err)
+		m := newMarch(&failingLookupFs{Fs: dstFs, errs: map[string]error{
+			"a": lookupA,
+			"b": lookupB,
+		}})
+		_, err = m.processJob(listDirJob{srcDepth: 1, dstDepth: 1})
+		require.ErrorIs(t, err, lookupA)
+		require.ErrorIs(t, err, lookupB)
+	})
+
+	t.Run("listing error survives", func(t *testing.T) {
+		dstFs, err := mockfs.NewFs(ctx, "mock", "", nil)
+		require.NoError(t, err)
+		m := newMarch(dstFs)
+		m.NoTraverse = false
+		_, err = m.processJob(listDirJob{srcDepth: 1, dstDepth: 1})
+		require.ErrorIs(t, err, listingErr)
+	})
+
+	t.Run("missing destination directory is not an error", func(t *testing.T) {
+		dstFs, err := mockfs.NewFs(ctx, "mock", "", nil)
+		require.NoError(t, err)
+		m := newMarch(dstFs)
+		m.NoTraverse = false
+		m.dstListDir = func(_ context.Context, _ string, _ fs.ListRCallback) error {
+			return fs.ErrorDirNotFound
+		}
+		_, err = m.processJob(listDirJob{srcDepth: 1, dstDepth: 1})
+		require.NoError(t, err)
+	})
 }

@@ -213,7 +213,7 @@ func (h *ReOpen) Read(p []byte) (n int, err error) {
 		h.offset += int64(nn)
 		if err != nil && err != io.EOF {
 			h.err = err
-			if !fserrors.IsNoLowLevelRetryError(err) {
+			if !fserrors.IsFatalError(err) && !fserrors.IsNoRetryError(err) && !fserrors.IsNoLowLevelRetryError(err) {
 				fs.DebugfCtx(h.ctx, h.src, "Reopening on read failure after offset %d bytes: retry %d/%d: %v", h.offset, h.tries, h.maxTries, err)
 				if h.reopen() == nil {
 					err = nil
@@ -332,12 +332,13 @@ func (h *ReOpen) SetAccounting(account AccountFn) *ReOpen {
 	return h
 }
 
-// Account sets the accounting function to account for n bytes being read
-func (h *ReOpen) Account(n int) *ReOpen {
-	if h.account != nil {
-		h.account(n)
+// Account calls the accounting function to account for n bytes being read,
+// returning its error to the caller.
+func (h *ReOpen) Account(n int) error {
+	if h.account == nil {
+		return nil
 	}
-	return h
+	return h.account(n)
 }
 
 // DelayAccounting makes sure the accounting function only gets called

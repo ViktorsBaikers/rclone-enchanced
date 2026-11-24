@@ -433,8 +433,41 @@ func MoveTransfer(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string,
 	return move(ctx, fdst, dst, remote, src, true)
 }
 
+// CheckUploadAdmission guards original intent, not temporary or comparison transport.
+func CheckUploadAdmission(ctx context.Context, fdst fs.Fs, source fs.Object, destinationRemote string) error {
+	return checkUploadAdmission(ctx, fdst, source, destinationRemote, nil)
+}
+
+func checkUploadAdmission(ctx context.Context, fdst fs.Fs, source fs.Object, destinationRemote string, copyErr error) error {
+	if fs.IsUploadAdmissionError(copyErr) {
+		return copyErr
+	}
+	if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+		primary, usable := intent.Destination.(fs.Fs)
+		if !usable || intent.Source == nil {
+			return &fs.UploadAdmissionError{Err: errors.Join(copyErr, errors.New("original upload admission identity is unavailable"))}
+		}
+		fdst, source, destinationRemote = primary, intent.Source, intent.DestinationRemote
+	}
+	checker, ok := fdst.(fs.UploadAdmissionChecker)
+	if !ok {
+		return copyErr
+	}
+	admitted, reconcileErr := checker.CheckUploadAdmission(ctx, source, destinationRemote)
+	if reconcileErr != nil || (copyErr != nil && admitted) {
+		return &fs.UploadAdmissionError{Err: errors.Join(copyErr, reconcileErr)}
+	}
+	return copyErr
+}
+
 // move - see Move for help
 func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.Object, isTransfer bool) (newDst fs.Object, err error) {
+	if _, inherited := fs.UploadAdmissionIntentFromContext(ctx); !inherited {
+		ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{Source: src, Destination: fdst, DestinationRemote: remote})
+	}
+	if err := CheckUploadAdmission(ctx, fdst, src, remote); err != nil {
+		return nil, err
+	}
 	origRemote := remote // avoid double-transform on fallback to copy
 	remote = transform.Path(ctx, remote, false)
 	if fs.FullPath(src) == fspath.JoinRootPath(fs.ConfigString(fdst), remote) {
@@ -493,6 +526,9 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 		in := tr.Account(ctx, nil) // account the transfer
 		in.ServerSideTransferStart()
 		newDst, err = doMove(ctx, src, remote)
+		if err != nil {
+			err = checkUploadAdmission(ctx, fdst, src, origRemote, err)
+		}
 		switch err {
 		case nil:
 			if newDst != nil && src.String() != newDst.String() {
@@ -774,6 +810,9 @@ func Retry(ctx context.Context, o any, maxTries int, fn func() error) (err error
 		}
 		// End if ctx is in error
 		if fserrors.ContextError(ctx, &err) {
+			break
+		}
+		if fserrors.IsFatalError(err) || fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) {
 			break
 		}
 		// Retry if err returned a retry error
@@ -1503,6 +1542,24 @@ func rcatSrc(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClos
 		sums := getSums()
 		size := int64(readCounter.BytesRead())
 		objInfo := object.NewStaticObjectInfo(dstFileName, modTime, size, false, sums, fsrc).WithMetadata(meta)
+		owner := fs.Info(fdst)
+		if intent, ok := fs.UploadAdmissionIntentFromContext(ctx); ok {
+			owner = intent.Destination
+		}
+		if _, aware := owner.(fs.UploadAdmissionChecker); aware {
+			_, durable := fs.UploadAdmissionStoreFromContext(ctx)
+			_, _, transient := fs.UploadAdmissionTransientScopeFromContext(ctx)
+			job := false
+			if cache.JobGetJobID != nil {
+				_, job = cache.JobGetJobID(fs.UploadAdmissionJobContext(ctx))
+			}
+			command := !fs.IsRCRequest(ctx) && fs.GetConfig(ctx).CommandRunID != 0
+			if !durable && !job && !command && !transient {
+				var release context.CancelFunc
+				ctx, release = fs.WithUploadAdmissionTransientScope(ctx)
+				defer release()
+			}
+		}
 		err = Retry(ctx, objInfo, ci.LowLevelRetries, func() error {
 			_, err = rs.Seek(0, io.SeekStart)
 			if err != nil {
@@ -1661,7 +1718,10 @@ func GetCompareDest(ctx context.Context) (CompareDest []fs.Fs, err error) {
 // be copied
 //
 // Returns True if src is in --compare-dest
-func compareDest(ctx context.Context, dst, src fs.Object, CompareDest fs.Fs) (NoNeedTransfer bool, err error) {
+func compareDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CompareDest fs.Fs, destinationRemote string) (NoNeedTransfer bool, err error) {
+	if err := CheckUploadAdmission(ctx, fdst, src, destinationRemote); err != nil {
+		return false, err
+	}
 	var remote string
 	if dst == nil {
 		remote = src.Remote()
@@ -1709,7 +1769,10 @@ func GetCopyDest(ctx context.Context, fdst fs.Fs) (CopyDest []fs.Fs, err error) 
 // be copied
 //
 // Returns True if src was copied from --copy-dest
-func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, backupDir fs.Fs) (NoNeedTransfer bool, err error) {
+func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, backupDir fs.Fs, destinationRemote string) (NoNeedTransfer bool, err error) {
+	if err := CheckUploadAdmission(ctx, fdst, src, destinationRemote); err != nil {
+		return false, err
+	}
 	var remote string
 	if dst == nil {
 		remote = src.Remote()
@@ -1733,6 +1796,9 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 			if dst != nil && fs.GetConfig(ctx).Immutable {
 				return false, nil
 			}
+			if _, inherited := fs.UploadAdmissionIntentFromContext(ctx); !inherited {
+				ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{Source: src, Destination: fdst, DestinationRemote: destinationRemote})
+			}
 			if dst != nil && backupDir != nil {
 				err = MoveBackupDir(ctx, backupDir, dst)
 				if err != nil {
@@ -1741,8 +1807,11 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 				// If successful zero out the dstObj as it is no longer there
 				dst = nil
 			}
-			_, err := Copy(ctx, fdst, dst, remote, CopyDestFile)
+			_, err := Copy(ctx, fdst, dst, destinationRemote, CopyDestFile)
 			if err != nil {
+				if admissionErr := checkUploadAdmission(ctx, fdst, src, destinationRemote, err); fs.IsUploadAdmissionError(admissionErr) {
+					return false, admissionErr
+				}
 				fs.ErrorfCtx(ctx, src, "Destination found in --copy-dest, error copying")
 				return false, nil
 			}
@@ -1760,18 +1829,21 @@ func copyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CopyDest, bac
 // does not need to be copied
 //
 // Returns True if src does not need to be copied
-func CompareOrCopyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CompareOrCopyDest []fs.Fs, backupDir fs.Fs) (NoNeedTransfer bool, err error) {
+func CompareOrCopyDest(ctx context.Context, fdst fs.Fs, dst, src fs.Object, CompareOrCopyDest []fs.Fs, backupDir fs.Fs, destinationRemote string) (NoNeedTransfer bool, err error) {
+	if err := CheckUploadAdmission(ctx, fdst, src, destinationRemote); err != nil {
+		return false, err
+	}
 	ci := fs.GetConfig(ctx)
 	if len(ci.CompareDest) > 0 {
 		for _, compareF := range CompareOrCopyDest {
-			NoNeedTransfer, err := compareDest(ctx, dst, src, compareF)
+			NoNeedTransfer, err := compareDest(ctx, fdst, dst, src, compareF, destinationRemote)
 			if NoNeedTransfer || err != nil {
 				return NoNeedTransfer, err
 			}
 		}
 	} else if len(ci.CopyDest) > 0 {
 		for _, copyF := range CompareOrCopyDest {
-			NoNeedTransfer, err := copyDest(ctx, fdst, dst, src, copyF, backupDir)
+			NoNeedTransfer, err := copyDest(ctx, fdst, dst, src, copyF, backupDir, destinationRemote)
 			if NoNeedTransfer || err != nil {
 				return NoNeedTransfer, err
 			}
@@ -2042,6 +2114,9 @@ func BackupDir(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, srcFileName string) 
 // MoveBackupDir moves a file to the backup dir
 func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err error) {
 	remoteWithSuffix := SuffixName(ctx, dst.Remote())
+	if err = CheckUploadAdmission(ctx, backupDir, dst, remoteWithSuffix); err != nil {
+		return err
+	}
 	overwritten, _ := backupDir.NewObject(ctx, remoteWithSuffix)
 	_, err = Move(ctx, backupDir, overwritten, remoteWithSuffix, dst)
 	return err
@@ -2064,6 +2139,12 @@ func needsMoveCaseInsensitive(fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFil
 // returns nil, nil if !needsMoveCaseInsensitive.
 // this does not account a transfer -- the caller should do that if desired.
 func MoveCaseInsensitive(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool, srcObj fs.Object) (newDst fs.Object, err error) {
+	if _, inherited := fs.UploadAdmissionIntentFromContext(ctx); !inherited {
+		ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{Source: srcObj, Destination: fdst, DestinationRemote: dstFileName})
+	}
+	if err := CheckUploadAdmission(ctx, fdst, srcObj, dstFileName); err != nil {
+		return nil, err
+	}
 	logger, _ := GetLogger(ctx)
 
 	// Choose operations
@@ -2130,12 +2211,22 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 		logger(ctx, TransferError, srcObj, nil, err)
 		return err
 	}
+	if _, inherited := fs.UploadAdmissionIntentFromContext(ctx); !inherited {
+		ctx = fs.WithUploadAdmissionIntent(ctx, fs.UploadAdmissionIntent{Source: srcObj, Destination: fdst, DestinationRemote: dstFileName})
+	}
+	if err := CheckUploadAdmission(ctx, fdst, srcObj, dstFileName); err != nil {
+		return err
+	}
 
 	// Find dst object if it exists
 	var dstObj fs.Object
 	if !ci.NoCheckDest {
-		dstObj, err = fdst.NewObject(ctx, dstFileName)
-		if errors.Is(err, fs.ErrorObjectNotFound) {
+		sourceRemote := srcObj.Remote()
+		discoveryCtx := fs.WithUploadAdmissionDiscovery(ctx, srcObj.Fs(), &sourceRemote)
+		dstObj, err = fdst.NewObject(discoveryCtx, dstFileName)
+		if fs.IsUploadAdmissionError(err) {
+			return err
+		} else if errors.Is(err, fs.ErrorObjectNotFound) {
 			dstObj = nil
 		} else if err != nil {
 			logger(ctx, TransferError, nil, dstObj, err)
@@ -2177,7 +2268,7 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 	}
 	needTransfer := NeedTransfer(ctx, dstObj, srcObj)
 	if needTransfer {
-		NoNeedTransfer, err := CompareOrCopyDest(ctx, fdst, dstObj, srcObj, copyDestDir, backupDir)
+		NoNeedTransfer, err := CompareOrCopyDest(ctx, fdst, dstObj, srcObj, copyDestDir, backupDir, dstFileName)
 		if err != nil {
 			return err
 		}
@@ -2210,7 +2301,7 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 		if ci.IgnoreExisting {
 			fs.DebugfCtx(ctx, srcObj, "Not removing source file as destination file exists and --ignore-existing is set")
 			logger(ctx, Match, srcObj, dstObj, nil)
-		} else if !SameObject(srcObj, dstObj) {
+		} else if dstObj == nil || !SameObject(srcObj, dstObj) {
 			err = DeleteFile(ctx, srcObj)
 			logger(ctx, Differ, srcObj, dstObj, nil)
 		}

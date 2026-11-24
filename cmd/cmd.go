@@ -76,6 +76,18 @@ func ShowVersion() {
 	fmt.Printf("- go/version: %s\n", runtime.Version())
 	fmt.Printf("- go/linking: %s\n", linking)
 	fmt.Printf("- go/tags: %s\n", tagString)
+	if fs.BuildCommit != "" {
+		fmt.Printf("- build/commit: %s\n", fs.BuildCommit)
+	}
+	if fs.BuildDate != "" {
+		fmt.Printf("- build/date: %s\n", fs.BuildDate)
+	}
+	if fs.BuildSnapshot != "" {
+		fmt.Printf("- build/snapshot: %s\n", fs.BuildSnapshot)
+	}
+	if fs.BuildDirty != "" {
+		fmt.Printf("- build/dirty: %s\n", fs.BuildDirty)
+	}
 }
 
 // NewFsFile creates an Fs from a name but may point to a file.
@@ -240,6 +252,11 @@ func ShowStats() bool {
 func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 	ctx := context.Background()
 	ci := fs.GetConfig(ctx)
+	if Retry {
+		savedRunID := ci.CommandRunID
+		ci.CommandRunID = fs.NewCommandRunID()
+		defer func() { ci.CommandRunID = savedRunID }()
+	}
 	var cmdErr error
 	stopStats := func() {}
 	if !showStats && ShowStats() {

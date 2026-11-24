@@ -1,7 +1,10 @@
 // Package api provides request and response types for the TelDrive v2 REST API.
 package api
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type ErrorDetail struct {
 	Code    string `json:"code,omitempty"`
@@ -88,22 +91,71 @@ type UploadCreateRequest struct {
 	PreferredPartSize int64     `json:"preferredPartSize,omitempty"`
 }
 
+type UploadCompleteRequest struct {
+	Size int64     `json:"size"`
+	Hash *FileHash `json:"hash,omitempty"`
+}
+
 type UploadSession struct {
-	ID             string     `json:"id"`
-	ParentId       string     `json:"parentId,omitempty"`
-	Name           string     `json:"name"`
-	ExpectedSize   int64      `json:"expectedSize"`
-	ExpectedHash   *FileHash  `json:"expectedHash,omitempty"`
-	MimeType       string     `json:"mimeType,omitempty"`
-	ModTime        time.Time  `json:"modTime"`
-	Encryption     bool       `json:"encryption"`
-	ConflictPolicy string     `json:"conflictPolicy"`
-	PartSize       int64      `json:"partSize"`
-	State          string     `json:"state"`
-	ExpiresAt      time.Time  `json:"expiresAt"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	CompletedAt    *time.Time `json:"completedAt,omitempty"`
-	FileId         string     `json:"fileId,omitempty"`
+	RequiresCompletionManifest bool                     `json:"requiresCompletionManifest"`
+	ID                         string                   `json:"id"`
+	ParentId                   string                   `json:"parentId,omitempty"`
+	Name                       string                   `json:"name"`
+	ExpectedSize               int64                    `json:"expectedSize"`
+	ExpectedHash               *FileHash                `json:"expectedHash,omitempty"`
+	MimeType                   string                   `json:"mimeType,omitempty"`
+	ModTime                    time.Time                `json:"modTime"`
+	Encryption                 bool                     `json:"encryption"`
+	ConflictPolicy             string                   `json:"conflictPolicy"`
+	PartSize                   int64                    `json:"partSize"`
+	State                      string                   `json:"state"`
+	ExpiresAt                  time.Time                `json:"expiresAt"`
+	CreatedAt                  time.Time                `json:"createdAt"`
+	CompletedAt                *time.Time               `json:"completedAt,omitempty"`
+	FileId                     string                   `json:"fileId,omitempty"`
+	CompletedReceipt           *GuardedCompletedReceipt `json:"completedReceipt,omitempty"`
+}
+
+// GuardedSlotExpectation is the captured slot intent: either an empty slot or
+// the exact file identity and generation that the guarded create replaces.
+type GuardedSlotExpectation struct {
+	Kind       string `json:"kind"`
+	FileID     string `json:"fileId,omitempty"`
+	Generation string `json:"generation,omitempty"`
+}
+
+// GuardedUploadDestination is the immutable destination of a guarded upload.
+// A nil MountRoot or ParentID explicitly means the account root.
+type GuardedUploadDestination struct {
+	MountRoot *string                `json:"mountRoot"`
+	ParentID  *string                `json:"parentId"`
+	Expected  GuardedSlotExpectation `json:"expected"`
+}
+
+type GuardedUploadCreateRequest struct {
+	Destination       GuardedUploadDestination `json:"destination"`
+	Name              string                   `json:"name"`
+	Size              int64                    `json:"size"`
+	MimeType          string                   `json:"mimeType,omitempty"`
+	ModTime           time.Time                `json:"modTime"`
+	Hash              *FileHash                `json:"hash,omitempty"`
+	Encryption        *bool                    `json:"encryption,omitempty"`
+	PreferredPartSize int64                    `json:"preferredPartSize,omitempty"`
+}
+
+// GuardedFileEntry is the commit-time result of a guarded upload.
+type GuardedFileEntry struct {
+	FileInfo
+	ParentPath     *string   `json:"parentPath,omitempty"`
+	ParentSegments *[]string `json:"parentSegments,omitempty"`
+}
+
+type GuardedCompletedReceipt struct {
+	AdmissionKey string           `json:"admissionKey"`
+	UploadId     string           `json:"uploadId"`
+	Size         int64            `json:"size"`
+	Hash         FileHash         `json:"hash"`
+	Result       GuardedFileEntry `json:"result"`
 }
 
 type UploadSessionPage struct {
@@ -156,12 +208,9 @@ type CategorySize struct {
 }
 
 type EventPayload struct {
-	ParentId string `json:"parentId,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Kind     string `json:"kind,omitempty"`
-	Status   string `json:"status,omitempty"`
-	State    string `json:"state,omitempty"`
-	FileId   string `json:"fileId,omitempty"`
+	Kind   string          `json:"kind,omitempty"`
+	Before json.RawMessage `json:"before,omitempty"`
+	After  json.RawMessage `json:"after,omitempty"`
 }
 
 type EventEnvelope struct {

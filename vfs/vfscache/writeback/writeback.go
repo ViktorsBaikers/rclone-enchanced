@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
@@ -21,6 +22,25 @@ const (
 
 // PutFn is the interface that item provides to store the data
 type PutFn func(context.Context) error
+
+// ErrHeld matches every HeldError.
+var ErrHeld = errors.New("vfs cache: upload is held")
+
+// HeldError is the typed non-runnable disposition. It is never retried and
+// never treated as success.
+type HeldError struct {
+	Reason string
+}
+
+func (e *HeldError) Error() string {
+	if e == nil || e.Reason == "" {
+		return "vfs cache: upload is held"
+	}
+	return "vfs cache: upload is held: " + e.Reason
+}
+
+// Is lets callers match any held disposition with errors.Is.
+func (e *HeldError) Is(target error) bool { return target == ErrHeld }
 
 // Handle is returned for callers to keep track of writeback items
 type Handle uint64
@@ -74,6 +94,7 @@ type writeBackItem struct {
 	putFn     PutFn              // To write the object data
 	tries     int                // number of times we have tried to upload
 	delay     time.Duration      // delay between upload attempts
+	held      string             // non-empty means non-runnable, never retried
 }
 
 // A writeBackItems implements a priority queue by implementing
@@ -263,6 +284,11 @@ func (wb *WriteBack) Add(id Handle, name string, size int64, modified bool, putF
 	wbItem, ok := wb.lookup[id]
 	if !ok {
 		wbItem = wb._newItem(id, name, size)
+	} else if wbItem.held != "" {
+		// A held generation stays non-runnable regardless of new writes.
+		wbItem.putFn = putFn
+		wbItem.size = size
+		return wbItem.id
 	} else if modified {
 		if wbItem.uploading {
 			// We are uploading already so cancel the upload
@@ -320,6 +346,10 @@ func (wb *WriteBack) Rename(id Handle, name string) {
 	if !ok {
 		return
 	}
+	if wbItem.held != "" {
+		// A held generation cannot be rehomed by a rename either.
+		return
+	}
 	if wbItem.uploading {
 		// We are uploading already so cancel the upload
 		wb._cancelUpload(wbItem)
@@ -355,6 +385,9 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 	// Recover around the upload itself rather than the whole goroutine, so a
 	// panicking backend is retried like any other upload failure below.
 	err := vfscommon.RecoverCall(wbItem.name, func() error { return putFn(ctx) })
+	// Distinguish a cancellation of our own upload context (rename or
+	// cancelUpload) from a cancellation the backend returned on its own.
+	ctxCanceled := ctx.Err() != nil
 	wb.mu.Lock()
 
 	wbItem.cancel() // cancel context to release resources since store done
@@ -363,6 +396,31 @@ func (wb *WriteBack) upload(ctx context.Context, wbItem *writeBackItem) {
 	wb.uploads--
 
 	if err != nil {
+		if errors.Is(err, ErrHeld) {
+			// A held generation is a durable disposition, not a transient
+			// failure: keep it out of the retry heap and never report success.
+			wbItem.held = err.Error()
+			fs.Errorf(wbItem.name, "vfs cache: upload held: %v", err)
+			wb._resetTimer()
+			close(wbItem.done)
+			return
+		}
+		// Admission failures are recoverable state conflicts that the
+		// caller can resolve, so they keep the transient retry path even
+		// when they carry a fatal wrapper.
+		terminal := fserrors.IsFatalError(err) && !fs.IsUploadAdmissionError(err)
+		// A cancellation returned by the backend itself terminates the
+		// generation; a cancellation of our own upload context is handled
+		// by the queue (rename/cancel) and must go back on the heap.
+		if !terminal && errors.Is(err, context.Canceled) && !ctxCanceled {
+			terminal = true
+		}
+		if terminal {
+			fs.Errorf(wbItem.name, "vfs cache: upload aborted terminally: %v", err)
+			wb._resetTimer()
+			close(wbItem.done)
+			return
+		}
 		// FIXME should this have a max number of transfer attempts?
 		wbItem.delay *= 2
 		if wbItem.delay > maxUploadDelay {
@@ -475,13 +533,14 @@ func (wb *WriteBack) Stats() (uploadsInProgress, uploadsQueued int) {
 // QueueInfo is information about an item queued for upload, returned
 // by Queue
 type QueueInfo struct {
-	Name      string  `json:"name"`      // name (full path) of the file,
-	ID        Handle  `json:"id"`        // id of queue item
-	Size      int64   `json:"size"`      // integer size of the file in bytes
-	Expiry    float64 `json:"expiry"`    // seconds from now which the file is eligible for transfer, oldest goes first
-	Tries     int     `json:"tries"`     // number of times we have tried to upload
-	Delay     float64 `json:"delay"`     // delay between upload attempts (s)
-	Uploading bool    `json:"uploading"` // true if item is being uploaded
+	Name      string  `json:"name"`           // name (full path) of the file,
+	ID        Handle  `json:"id"`             // id of queue item
+	Size      int64   `json:"size"`           // integer size of the file in bytes
+	Expiry    float64 `json:"expiry"`         // seconds from now which the file is eligible for transfer, oldest goes first
+	Tries     int     `json:"tries"`          // number of times we have tried to upload
+	Delay     float64 `json:"delay"`          // delay between upload attempts (s)
+	Uploading bool    `json:"uploading"`      // true if item is being uploaded
+	Held      string  `json:"held,omitempty"` // non-empty means non-runnable
 }
 
 // Queue return info about the current upload queue
@@ -502,6 +561,7 @@ func (wb *WriteBack) Queue() []QueueInfo {
 			Tries:     wbItem.tries,
 			Delay:     wbItem.delay.Seconds(),
 			Uploading: wbItem.uploading,
+			Held:      wbItem.held,
 		})
 	}
 
@@ -534,6 +594,10 @@ func (wb *WriteBack) SetExpiry(id Handle, expiry time.Time, relative time.Durati
 	wbItem, ok := wb.lookup[id]
 	if !ok {
 		return ErrorIDNotFound
+	}
+	if wbItem.held != "" {
+		// Expiry is not authority to run held work.
+		return nil
 	}
 
 	// If expiry is not supplied, use expiry of item

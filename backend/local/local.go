@@ -437,6 +437,7 @@ type Object struct {
 	mode    os.FileMode
 	modTime time.Time
 	hashes  map[hash.Type]string // Hashes
+	info    os.FileInfo          // identity and metadata of the last observed file
 	// these are read only and don't need the mutex held
 	translatedLink bool // Is this object a translated link
 }
@@ -1318,79 +1319,42 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 		return "", nil
 	}
 
-	// Check that the underlying file hasn't changed
-	o.fs.objectMetaMu.RLock()
-	oldtime := o.modTime
-	oldsize := o.size
-	o.fs.objectMetaMu.RUnlock()
-	err := o.lstat()
-	var changed bool
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// If file not found then we assume any accumulated
-			// hashes are OK - this will error on Open
-			changed = true
-		} else {
-			return "", fmt.Errorf("hash: failed to stat: %w", err)
-		}
-	} else {
-		o.fs.objectMetaMu.RLock()
-		changed = !o.modTime.Equal(oldtime) || oldsize != o.size
-		o.fs.objectMetaMu.RUnlock()
+	if err := o.lstat(); err != nil {
+		return "", fmt.Errorf("hash: failed to stat: %w", err)
 	}
-
 	o.fs.objectMetaMu.RLock()
 	hashValue, hashFound := o.hashes[r]
 	o.fs.objectMetaMu.RUnlock()
-
-	if changed || !hashFound {
-		var in io.ReadCloser
-
-		if !o.translatedLink {
-			var fd *os.File
-			fd, err = file.Open(o.path)
-			if fd != nil {
-				in = fd
-			}
-		} else {
-			in, err = o.openTranslatedLink(0, -1)
-		}
-		// If not checking for updates, only read size given
-		if o.fs.opt.NoCheckUpdated {
-			in = readers.NewLimitedReadCloser(in, o.size)
-		}
-		if err != nil {
-			return "", fmt.Errorf("hash: failed to open: %w", err)
-		}
-		var hashes map[hash.Type]string
-		hashes, err = hash.StreamTypes(readers.NewContextReader(ctx, in), hash.NewHashSet(r))
-		closeErr := in.Close()
-		if err != nil {
-			return "", fmt.Errorf("hash: failed to read: %w", err)
-		}
-		if closeErr != nil {
-			return "", fmt.Errorf("hash: failed to close: %w", closeErr)
-		}
-		hashValue = hashes[r]
-		o.fs.objectMetaMu.Lock()
-		if o.hashes == nil {
-			o.hashes = hashes
-		} else {
-			o.hashes[r] = hashValue
-		}
-		o.fs.objectMetaMu.Unlock()
+	if hashFound {
+		return hashValue, nil
+	}
+	hashes := hash.NewHashSet(r)
+	if o.translatedLink {
+		hashes = 0
+	}
+	in, err := o.Open(ctx, &fs.HashesOption{Hashes: hashes})
+	if err != nil {
+		return "", fmt.Errorf("hash: failed to open: %w", err)
+	}
+	if reader, ok := in.(*localOpenFile); ok {
+		// Close verifies read provenance without a stat syscall for every hash read.
+		_, err = io.Copy(reader.hash, readers.NewContextReader(ctx, reader.in))
+		reader.sums = reader.hash.Sums()
+		hashValue = reader.sums[r]
+	} else {
+		// Translated links have no opened file identity, so do not cache their hashes.
+		var sums map[hash.Type]string
+		sums, err = hash.StreamTypes(readers.NewContextReader(ctx, in), hash.NewHashSet(r))
+		hashValue = sums[r]
+	}
+	closeErr := in.Close()
+	if err != nil {
+		return "", fmt.Errorf("hash: failed to read: %w", err)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("hash: failed to close: %w", closeErr)
 	}
 	return hashValue, nil
-}
-
-// SetHash caches a hash calculated while reading this object.
-func (o *Object) SetHash(_ context.Context, ty hash.Type, value string) {
-	o.fs.objectMetaMu.Lock()
-	if o.hashes == nil {
-		o.hashes = make(map[hash.Type]string)
-	}
-	o.hashes[ty] = value
-	o.fs.objectMetaMu.Unlock()
 }
 
 // Size returns the size of an object in bytes
@@ -1463,10 +1427,12 @@ func (o *Object) Storable() bool {
 // localOpenFile wraps an io.ReadCloser and updates the md5sum of the
 // object that is read
 type localOpenFile struct {
-	o    *Object           // object that is open
-	in   io.ReadCloser     // handle we are wrapping
-	hash *hash.MultiHasher // currently accumulating hashes
-	fd   *os.File          // file object reference
+	o     *Object              // object that is open
+	in    io.ReadCloser        // handle we are wrapping
+	hash  *hash.MultiHasher    // currently accumulating hashes
+	fd    *os.File             // file object reference
+	start os.FileInfo          // immutable identity and metadata at read start
+	sums  map[hash.Type]string // finalized hashes, shared with the cache only after verification
 }
 
 // Read bytes from the object - see io.Reader
@@ -1477,10 +1443,8 @@ func (file *localOpenFile) Read(p []byte) (n int, err error) {
 		if err != nil {
 			return 0, fmt.Errorf("can't read status of source file while transferring: %w", err)
 		}
-		file.o.fs.objectMetaMu.RLock()
-		oldtime := file.o.modTime
-		oldsize := file.o.size
-		file.o.fs.objectMetaMu.RUnlock()
+		oldtime := readTime(file.o.fs.opt.TimeType, file.start)
+		oldsize := file.start.Size()
 		if oldsize != fi.Size() {
 			return 0, fserrors.NoLowLevelRetryError(fmt.Errorf("can't copy - source file is being updated (size changed from %d to %d)", oldsize, fi.Size()))
 		}
@@ -1499,13 +1463,25 @@ func (file *localOpenFile) Read(p []byte) (n int, err error) {
 
 // Close the object and update the hashes
 func (file *localOpenFile) Close() (err error) {
+	end, statErr := file.fd.Stat()
+	current, pathErr := file.o.fs.lstat(file.o.path)
 	err = file.in.Close()
-	if err == nil {
-		if file.hash.Size() == file.o.Size() {
-			file.o.fs.objectMetaMu.Lock()
-			file.o.hashes = file.hash.Sums()
-			file.o.fs.objectMetaMu.Unlock()
+	if err == nil && statErr == nil && pathErr == nil && file.hash.Size() == file.start.Size() &&
+		file.o.sameFileInfo(file.start, end) && file.o.sameFileInfo(file.start, current) {
+		file.o.fs.objectMetaMu.Lock()
+		if file.o.sameFileInfo(file.start, file.o.info) {
+			if file.sums == nil {
+				file.sums = file.hash.Sums()
+			}
+			if file.o.hashes == nil {
+				file.o.hashes = file.sums
+			} else {
+				for ty, value := range file.sums {
+					file.o.hashes[ty] = value
+				}
+			}
 		}
+		file.o.fs.objectMetaMu.Unlock()
 	}
 	return err
 }
@@ -1561,7 +1537,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	// file is being extended, readers will read a o.Size() bytes rather
 	// than the new size making for a consistent upload.
 	if limit < 0 && o.fs.opt.NoCheckUpdated {
-		limit = o.size
+		limit = o.Size()
 	}
 
 	// Handle a translated link
@@ -1584,12 +1560,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		// no need to wrap since we don't need checksums
 		return wrappedFd, nil
 	}
+	start, err := fd.Stat()
+	if err != nil {
+		_ = fd.Close()
+		return nil, err
+	}
 	// Update the hashes as we go along
 	in = &localOpenFile{
-		o:    o,
-		in:   wrappedFd,
-		hash: hasher,
-		fd:   fd,
+		o:     o,
+		in:    wrappedFd,
+		hash:  hasher,
+		fd:    fd,
+		start: start,
 	}
 	return in, nil
 }
@@ -1869,13 +1851,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	// All successful so update the hashes
-	if hasher != nil {
-		o.fs.objectMetaMu.Lock()
-		o.hashes = hasher.Sums()
-		o.fs.objectMetaMu.Unlock()
-	}
-
 	// Set the mtime
 	err = o.SetModTime(ctx, src.ModTime(ctx))
 	if err != nil {
@@ -1893,7 +1868,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	// ReRead info now that we have finished
-	return o.lstat()
+	if err := o.lstat(); err != nil {
+		return err
+	}
+	if hasher != nil {
+		o.fs.objectMetaMu.Lock()
+		if hasher.Size() == o.size {
+			o.hashes = hasher.Sums()
+		}
+		o.fs.objectMetaMu.Unlock()
+	}
+	return nil
 }
 
 var sparseWarning sync.Once
@@ -1965,17 +1950,26 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (write
 	}, nil
 }
 
+func (o *Object) sameFileInfo(a, b os.FileInfo) bool {
+	return a != nil && b != nil && os.SameFile(a, b) && a.Size() == b.Size() &&
+		a.ModTime().Equal(b.ModTime()) && readTime(o.fs.opt.TimeType, a).Equal(readTime(o.fs.opt.TimeType, b))
+}
+
 // setMetadata sets the file info from the os.FileInfo passed in
 func (o *Object) setMetadata(info os.FileInfo) {
-	// if not checking updated then don't update the stat
+	o.fs.objectMetaMu.Lock()
+	defer o.fs.objectMetaMu.Unlock()
+	if !o.sameFileInfo(o.info, info) {
+		o.hashes = nil
+	}
+	// If not checking updated then keep the original transfer metadata.
 	if o.fs.opt.NoCheckUpdated && !o.modTime.IsZero() {
 		return
 	}
-	o.fs.objectMetaMu.Lock()
+	o.info = info
 	o.size = info.Size()
 	o.modTime = readTime(o.fs.opt.TimeType, info)
 	o.mode = info.Mode()
-	o.fs.objectMetaMu.Unlock()
 	// Read the size of the link.
 	//
 	// The value in info.Size() is not always correct
